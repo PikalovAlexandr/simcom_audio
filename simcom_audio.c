@@ -3,10 +3,6 @@
  * SIMCom USB Audio Driver (patched version)
  * for SIM7600 / SIM7500 / SIM7100 modules
  *
- * Updated: 2025-10-17
- * - Always creates both playback & capture PCM streams
- * - Improved logging for debugging
- * - Keeps sysfs control (/sys/class/sound/simcom_audioX/audio_enabled)
  * - Compatible with ALSA core for Android 10 on rk3399
  */
 
