@@ -21,7 +21,7 @@
 #define SIMCOM_PCM_CHANS  1
 #define SIMCOM_PCM_BITS   16
 
-#define NUM_URBS 4
+#define NUM_URBS 1
 
 struct simcom_audio {
     struct usb_device *udev;
@@ -52,11 +52,11 @@ static struct snd_pcm_hardware simcom_playback_hw = {
     .rate_max = 8000,
     .channels_min = 1,             
     .channels_max = 1,
-    .buffer_bytes_max = 64 * 1024,
-    .period_bytes_min = 320,
-    .period_bytes_max = 4096,
+    .buffer_bytes_max = 1024*64,
+    .period_bytes_min = 640,
+    .period_bytes_max = 640,
     .periods_min = 2,
-    .periods_max = 64,
+    .periods_max = 4,
 };
 
 static struct snd_pcm_hardware simcom_capture_hw = {
@@ -68,11 +68,11 @@ static struct snd_pcm_hardware simcom_capture_hw = {
     .rate_max = 8000,
     .channels_min = 1,
     .channels_max = 1,
-    .buffer_bytes_max = 64 * 1024,
-    .period_bytes_min = 320,
-    .period_bytes_max = 4096,
+    .buffer_bytes_max = 1024*64,
+    .period_bytes_min = 1600,
+    .period_bytes_max = 1600,
     .periods_min = 2,
-    .periods_max = 64,
+    .periods_max = 4,
 };
 
 /* ========================================================= */
@@ -85,14 +85,17 @@ static void simcom_playback_urb_complete(struct urb *urb)
     struct simcom_audio *chip = snd_pcm_substream_chip(substream);
     
     if (!chip || !chip->playback_running)
+     pr_info("!chip || !chip->playback_running");
         return;
         
     if (urb->status == 0) {
+        pr_info("URb send Ok");
         snd_pcm_period_elapsed(substream);
         
         if (chip->playback_running) {
             if (usb_submit_urb(urb, GFP_ATOMIC) < 0)
                 pr_err("simcom_audio: failed to resubmit playback URB\n");
+                pr_info("chip->playback_running");
         }
     } else if (urb->status != -ENOENT) {
         pr_err("simcom_audio: playback URB error: %d\n", urb->status);
