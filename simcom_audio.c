@@ -48,6 +48,10 @@ struct simcom_audio {
     
     int playback_running;
     int capture_running;
+
+    /* Monotonic counters in frames to report accurate hw pointer */
+    u64 playback_hw_frames;
+    u64 capture_hw_frames;
 };
 
 /* ========================================================= */
@@ -70,8 +74,8 @@ static struct snd_pcm_hardware simcom_playback_hw = {
     .buffer_bytes_max = 1024*64,
     .period_bytes_min = 640,   /* 320 samples × 16 bits */
     .period_bytes_max = 640,
-    .periods_min = 2,
-    .periods_max = 4,
+    .periods_min = 4,
+    .periods_max = 8,
 };
 
 /* Capture: Module to External MPU
@@ -90,8 +94,8 @@ static struct snd_pcm_hardware simcom_capture_hw = {
     .buffer_bytes_max = 1024*64,
     .period_bytes_min = 1600,  /* 800 samples × 16 bits */
     .period_bytes_max = 1600,
-    .periods_min = 2,
-    .periods_max = 4,
+    .periods_min = 4,
+    .periods_max = 8,
 };
 
 /* ========================================================= */
@@ -120,6 +124,10 @@ static void simcom_playback_urb_complete(struct urb *urb)
     if (!chip)
         return;
 
+    /* Check if buffer was freed (e.g. during shutdown) */
+    if (!ctx->buf)
+        return;
+
     runtime = substream->runtime;
     if (!runtime)
         return;
@@ -142,10 +150,7 @@ static void simcom_playback_urb_complete(struct urb *urb)
         return;
     }
 
-    /* Inform ALSA one period has been processed */
-    snd_pcm_period_elapsed(substream);
-
-    /* Prepare next period: advance offset and copy from ALSA ring to URB buf */
+    /* Advance offset for next period */
     ctx->offset += period_bytes;
     if (ctx->offset >= buffer_bytes)
         ctx->offset -= buffer_bytes;
@@ -154,6 +159,10 @@ static void simcom_playback_urb_complete(struct urb *urb)
     memcpy(ctx->buf, runtime->dma_area + ctx->offset, period_bytes);
     urb->transfer_buffer = ctx->buf;
     urb->transfer_buffer_length = period_bytes;
+    
+    /* Advance hardware frame counter and inform ALSA about one elapsed period */
+    chip->playback_hw_frames += runtime->period_size;
+    snd_pcm_period_elapsed(substream);
 
     ret = usb_submit_urb(urb, GFP_ATOMIC);
     if (ret < 0)
@@ -186,6 +195,10 @@ static void simcom_capture_urb_complete(struct urb *urb)
     if (!chip)
         return;
 
+    /* Check if buffer was freed (e.g. during shutdown) */
+    if (!ctx->buf)
+        return;
+
     runtime = substream->runtime;
     if (!runtime)
         return;
@@ -211,7 +224,8 @@ static void simcom_capture_urb_complete(struct urb *urb)
     /* Copy captured data from URB coherent buffer into ALSA ring buffer */
     memcpy(runtime->dma_area + ctx->offset, urb->transfer_buffer, min_t(unsigned int, urb->actual_length, period_bytes));
 
-    /* Inform ALSA one period is available */
+    /* Advance hardware frame counter and inform ALSA one period is available */
+    chip->capture_hw_frames += runtime->period_size;
     snd_pcm_period_elapsed(substream);
 
     /* Advance to next period */
@@ -390,6 +404,9 @@ static int simcom_playback_prepare(struct snd_pcm_substream *substream)
         return -ENODEV;
     }
 
+    /* Reset hardware frames counter */
+    chip->playback_hw_frames = 0;
+
     ret = simcom_audio_create_playback_urbs(chip);
     if (ret < 0) {
         pr_err("simcom_audio: failed to create playback URBs\n");
@@ -496,6 +513,9 @@ static int simcom_capture_prepare(struct snd_pcm_substream *substream)
         return -ENODEV;
     }
 
+    /* Reset hardware frames counter */
+    chip->capture_hw_frames = 0;
+
     ret = simcom_audio_create_capture_urbs(chip);
     if (ret < 0) {
         pr_err("simcom_audio: failed to create capture URBs\n");
@@ -560,14 +580,36 @@ static int simcom_pcm_hw_free(struct snd_pcm_substream *substream)
     int i;
     
     if (chip) {
+        /* Disable the stream first */
+        unsigned long flags;
+        spin_lock_irqsave(&chip->lock, flags);
+        if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+            chip->playback_running = 0;
+        } else {
+            chip->capture_running = 0;
+        }
+        spin_unlock_irqrestore(&chip->lock, flags);
+        
+        /* Kill URBs first before freeing buffers */
         if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
             for (i = 0; i < NUM_URBS; i++) {
                 if (chip->urb_out[i]) {
                     usb_kill_urb(chip->urb_out[i]);
-                    if (chip->urb_out_ctx[i].buf)
-                        usb_free_coherent(chip->udev, chip->urb_out_ctx[i].period_bytes,
-                                          chip->urb_out_ctx[i].buf, chip->urb_out_ctx[i].dma);
+                }
+            }
+            /* Wait for all completion callbacks to finish */
+            msleep(20);
+            /* Now free buffers (marking as freed first) and URBs */
+            for (i = 0; i < NUM_URBS; i++) {
+                /* Mark buffer as freed before deallocation */
+                if (chip->urb_out_ctx[i].buf) {
+                    void *buf = chip->urb_out_ctx[i].buf;
+                    dma_addr_t dma = chip->urb_out_ctx[i].dma;
+                    unsigned int size = chip->urb_out_ctx[i].period_bytes;
                     chip->urb_out_ctx[i].buf = NULL;
+                    usb_free_coherent(chip->udev, size, buf, dma);
+                }
+                if (chip->urb_out[i]) {
                     usb_free_urb(chip->urb_out[i]);
                     chip->urb_out[i] = NULL;
                 }
@@ -576,10 +618,21 @@ static int simcom_pcm_hw_free(struct snd_pcm_substream *substream)
             for (i = 0; i < NUM_URBS; i++) {
                 if (chip->urb_in[i]) {
                     usb_kill_urb(chip->urb_in[i]);
-                    if (chip->urb_in_ctx[i].buf)
-                        usb_free_coherent(chip->udev, chip->urb_in_ctx[i].period_bytes,
-                                          chip->urb_in_ctx[i].buf, chip->urb_in_ctx[i].dma);
+                }
+            }
+            /* Wait for all completion callbacks to finish */
+            msleep(20);
+            /* Now free buffers (marking as freed first) and URBs */
+            for (i = 0; i < NUM_URBS; i++) {
+                /* Mark buffer as freed before deallocation */
+                if (chip->urb_in_ctx[i].buf) {
+                    void *buf = chip->urb_in_ctx[i].buf;
+                    dma_addr_t dma = chip->urb_in_ctx[i].dma;
+                    unsigned int size = chip->urb_in_ctx[i].period_bytes;
                     chip->urb_in_ctx[i].buf = NULL;
+                    usb_free_coherent(chip->udev, size, buf, dma);
+                }
+                if (chip->urb_in[i]) {
                     usb_free_urb(chip->urb_in[i]);
                     chip->urb_in[i] = NULL;
                 }
@@ -594,29 +647,20 @@ static snd_pcm_uframes_t simcom_pcm_pointer(struct snd_pcm_substream *substream)
 {
     struct simcom_audio *chip;
     struct snd_pcm_runtime *runtime;
-    struct timespec64 now;
-    u64 delta_ns;
-    u64 frames;
-    
+    snd_pcm_uframes_t pos;
+
     chip = snd_pcm_substream_chip(substream);
     runtime = substream->runtime;
-    
+
     if (!chip || !runtime)
         return 0;
-    
-    ktime_get_ts64(&now);
-    
-    if (runtime->status->state == SNDRV_PCM_STATE_RUNNING) {
-        /* Вычисляем разницу во времени в наносекундах */
-        delta_ns = (now.tv_sec - runtime->trigger_tstamp.tv_sec) * NSEC_PER_SEC +
-                   (now.tv_nsec - runtime->trigger_tstamp.tv_nsec);
-        
-        /* Конвертируем время в фреймы */
-        frames = (delta_ns * runtime->rate) / NSEC_PER_SEC;
-        return frames % runtime->buffer_size;
-    }
-    
-    return 0;
+
+    if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+        pos = (snd_pcm_uframes_t)(chip->playback_hw_frames % runtime->buffer_size);
+    else
+        pos = (snd_pcm_uframes_t)(chip->capture_hw_frames % runtime->buffer_size);
+
+    return pos;
 }
 
 /* ========================================================= */
