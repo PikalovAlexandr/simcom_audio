@@ -11,6 +11,8 @@
 #include <sound/initval.h>
 #include <sound/pcm_params.h>
 #include <linux/jiffies.h>
+#include <linux/workqueue.h>
+#include <linux/timer.h>
 
 #define SIMCOM_VENDOR_ID  0x1E0E
 #define SIMCOM_PRODUCT_ID 0x9001
@@ -22,7 +24,11 @@
 #define SIMCOM_PCM_CHANS  1
 #define SIMCOM_PCM_BITS   16
 
-#define NUM_URBS 4
+#define NUM_URBS 2
+#define PLAYBACK_INTERVAL_MS 40  // 640 bytes every 40ms (320 samples)
+#define PLAYBACK_INTERVAL_JIFFIES msecs_to_jiffies(PLAYBACK_INTERVAL_MS)
+#define CAPTURE_INTERVAL_MS 100  // 1600 bytes every 100ms (800 samples)
+#define CAPTURE_INTERVAL_JIFFIES msecs_to_jiffies(CAPTURE_INTERVAL_MS)
 
 struct simcom_urb_context {
     struct snd_pcm_substream *substream;
@@ -30,6 +36,8 @@ struct simcom_urb_context {
     void *buf;            // coherent buffer for USB transfer
     dma_addr_t dma;       // DMA address for coherent buffer
     unsigned int period_bytes; // cached period size in bytes for this URB
+    struct delayed_work submit_work; // delayed work for timed submission
+    unsigned int accum_len;   // per-URB aggregation counter for capture
 };
 
 struct simcom_audio {
@@ -49,9 +57,18 @@ struct simcom_audio {
     int playback_running;
     int capture_running;
 
+    /* Timing control for playback: 640 bytes every 40ms */
+    unsigned long last_playback_time;  // jiffies of last URB submission
+    
+    /* Timing control for capture: 1600 bytes every 100ms */
+    unsigned long last_capture_time;   // jiffies of last URB submission
+    
     /* Monotonic counters in frames to report accurate hw pointer */
     u64 playback_hw_frames;
     u64 capture_hw_frames;
+
+    unsigned int capture_period_bytes;   /* should be 1600 */
+    unsigned int playback_period_bytes;  /* should be 640 */
 };
 
 /* ========================================================= */
@@ -102,6 +119,100 @@ static struct snd_pcm_hardware simcom_capture_hw = {
 /* URB COMPLETION HANDLERS                                   */
 /* ========================================================= */
 
+/* Workqueue function to submit URB after time delay */
+static void simcom_playback_submit_work_fn(struct work_struct *work)
+{
+    struct delayed_work *dwork = to_delayed_work(work);
+    struct simcom_urb_context *ctx = container_of(dwork, struct simcom_urb_context, submit_work);
+    struct snd_pcm_substream *substream = ctx->substream;
+    struct simcom_audio *chip;
+    struct urb *urb;
+    unsigned long flags;
+    int ret;
+    int i;
+
+    if (!substream)
+        return;
+
+    chip = snd_pcm_substream_chip(substream);
+    if (!chip)
+        return;
+
+    /* Find the URB for this context */
+    spin_lock_irqsave(&chip->lock, flags);
+    
+    if (!chip->playback_running) {
+        spin_unlock_irqrestore(&chip->lock, flags);
+        return;
+    }
+
+    for (i = 0; i < NUM_URBS; i++) {
+        if (&chip->urb_out_ctx[i] == ctx && chip->urb_out[i]) {
+            urb = chip->urb_out[i];
+            
+            /* Update last submission time */
+            chip->last_playback_time = jiffies;
+            
+            ret = usb_submit_urb(urb, GFP_ATOMIC);
+            if (ret < 0) {
+                pr_err("simcom_audio: failed to submit playback URB from workqueue: %d\n", ret);
+            } else {
+                pr_debug("simcom_audio: playback URB submitted from workqueue, off=%u\n", ctx->offset);
+            }
+            break;
+        }
+    }
+    
+    spin_unlock_irqrestore(&chip->lock, flags);
+}
+
+/* Workqueue function to submit capture URB after time delay */
+static void simcom_capture_submit_work_fn(struct work_struct *work)
+{
+    struct delayed_work *dwork = to_delayed_work(work);
+    struct simcom_urb_context *ctx = container_of(dwork, struct simcom_urb_context, submit_work);
+    struct snd_pcm_substream *substream = ctx->substream;
+    struct simcom_audio *chip;
+    struct urb *urb;
+    unsigned long flags;
+    int ret;
+    int i;
+
+    if (!substream)
+        return;
+
+    chip = snd_pcm_substream_chip(substream);
+    if (!chip)
+        return;
+
+    /* Find the URB for this context */
+    spin_lock_irqsave(&chip->lock, flags);
+    
+    if (!chip->capture_running) {
+        spin_unlock_irqrestore(&chip->lock, flags);
+        return;
+    }
+
+    for (i = 0; i < NUM_URBS; i++) {
+        if (&chip->urb_in_ctx[i] == ctx && chip->urb_in[i]) {
+            urb = chip->urb_in[i];
+            
+            /* Update last submission time */
+            chip->last_capture_time = jiffies;
+            
+            ret = usb_submit_urb(urb, GFP_ATOMIC);
+            if (ret < 0) {
+                pr_err("simcom_audio: failed to submit capture URB from workqueue: %d\n", ret);
+            } else {
+                pr_debug("simcom_audio: capture URB submitted from workqueue, off=%u\n", ctx->offset);
+            }
+            break;
+        }
+    }
+    
+    spin_unlock_irqrestore(&chip->lock, flags);
+}
+
 static void simcom_playback_urb_complete(struct urb *urb)
 {
     struct simcom_urb_context *ctx = urb->context;
@@ -132,11 +243,13 @@ static void simcom_playback_urb_complete(struct urb *urb)
     if (!runtime)
         return;
 
-    pr_debug("simcom_audio: playback URB complete, status=%d len=%u\n", urb->status, urb->actual_length);
+    pr_info("simcom_audio: playback URB complete, status=%d len=%u\n", urb->status, urb->actual_length);
     
     if (urb->status < 0) {
         if (urb->status != -ENOENT && urb->status != -ECONNRESET)
             pr_err("simcom_audio: playback URB error: %d\n", urb->status);
+        else
+            pr_debug("simcom_audio: playback URB cancelled/reset (status=%d)\n", urb->status);
         return;
     }
 
@@ -164,11 +277,37 @@ static void simcom_playback_urb_complete(struct urb *urb)
     chip->playback_hw_frames += runtime->period_size;
     snd_pcm_period_elapsed(substream);
 
-    ret = usb_submit_urb(urb, GFP_ATOMIC);
-    if (ret < 0)
-        pr_err("simcom_audio: failed to resubmit playback URB: %d\n", ret);
-    else
-        pr_debug("simcom_audio: playback URB resubmitted, next_off=%u len=%u\n", ctx->offset, period_bytes);
+    /* Timing control: submit next URB only after 40ms interval */
+    {
+        unsigned long now = jiffies;
+        unsigned long elapsed = now - chip->last_playback_time;
+        unsigned long delay_jiffies = 0;
+        
+        if (elapsed < PLAYBACK_INTERVAL_JIFFIES) {
+            /* Need to wait - submit via delayed workqueue */
+            delay_jiffies = PLAYBACK_INTERVAL_JIFFIES - elapsed;
+            spin_unlock_irqrestore(&chip->lock, flags);
+            
+            ret = queue_delayed_work(system_wq, &ctx->submit_work, delay_jiffies);
+            if (ret) {
+                pr_info("simcom_audio: playback URB scheduled for %u ms later (elapsed=%lu jiffies)\n", 
+                         jiffies_to_msecs(delay_jiffies), elapsed);
+            } else {
+                pr_err("simcom_audio: failed to schedule delayed playback URB\n");
+            }
+            return;
+        }
+        
+        /* Enough time passed or first submission - submit immediately */
+        chip->last_playback_time = now;
+        
+        ret = usb_submit_urb(urb, GFP_ATOMIC);
+        if (ret < 0)
+            pr_err("simcom_audio: failed to resubmit playback URB: %d\n", ret);
+        else
+            pr_info("simcom_audio: playback URB resubmitted immediately, next_off=%u len=%u elapsed=%lu jiffies\n", 
+                    ctx->offset, period_bytes, elapsed);
+    }
 
     spin_unlock_irqrestore(&chip->lock, flags);
 }
@@ -182,7 +321,6 @@ static void simcom_capture_urb_complete(struct urb *urb)
     unsigned long flags;
     unsigned int period_bytes;
     unsigned int buffer_bytes;
-    int ret;
 
     if (!urb || !ctx)
         return;
@@ -204,8 +342,20 @@ static void simcom_capture_urb_complete(struct urb *urb)
         return;
 
     if (urb->status < 0) {
-        if (urb->status != -ENOENT && urb->status != -ECONNRESET)
+        if (urb->status == -EOVERFLOW) {
+            /* Device produced data when we weren't ready; re-arm after 100ms */
+            unsigned long delay = CAPTURE_INTERVAL_JIFFIES;
+            spin_lock_irqsave(&chip->lock, flags);
+            if (chip->capture_running) {
+                spin_unlock_irqrestore(&chip->lock, flags);
+                queue_delayed_work(system_wq, &ctx->submit_work, delay);
+            } else {
+                spin_unlock_irqrestore(&chip->lock, flags);
+            }
+            pr_err("simcom_audio: capture EOVERFLOW, rescheduling in 100ms\n");
+        } else if (urb->status != -ENOENT && urb->status != -ECONNRESET) {
             pr_err("simcom_audio: capture URB error: %d\n", urb->status);
+        }
         return;
     }
 
@@ -221,28 +371,39 @@ static void simcom_capture_urb_complete(struct urb *urb)
         return;
     }
 
-    /* Copy captured data from URB coherent buffer into ALSA ring buffer */
-    memcpy(runtime->dma_area + ctx->offset, urb->transfer_buffer, min_t(unsigned int, urb->actual_length, period_bytes));
+    /* Aggregate incoming data to exact 1600-byte packets before reporting */
+    /* Use per-URB offset to avoid race conditions */
+    {
+        unsigned int bytes_left = urb->actual_length;
+        unsigned int copied = 0;
+        while (bytes_left > 0) {
+            unsigned int need = chip->capture_period_bytes - ctx->accum_len;
+            unsigned int take = min(need, bytes_left);
+            memcpy(runtime->dma_area + ctx->offset + ctx->accum_len,
+                   urb->transfer_buffer + copied, take);
+            ctx->accum_len += take;
+            copied += take;
+            bytes_left -= take;
 
-    /* Advance hardware frame counter and inform ALSA one period is available */
-    chip->capture_hw_frames += runtime->period_size;
-    snd_pcm_period_elapsed(substream);
+            if (ctx->accum_len == chip->capture_period_bytes) {
+                /* Completed one full 1600-byte packet */
+                chip->capture_hw_frames += runtime->period_size;
+                snd_pcm_period_elapsed(substream);
 
-    /* Advance to next period */
-    ctx->offset += period_bytes;
-    if (ctx->offset >= buffer_bytes)
-        ctx->offset -= buffer_bytes;
+                ctx->offset += chip->capture_period_bytes;
+                if (ctx->offset >= buffer_bytes)
+                    ctx->offset -= buffer_bytes;
+                ctx->accum_len = 0;
+            }
+        }
+    }
 
     urb->transfer_buffer = ctx->buf;
     urb->transfer_buffer_length = period_bytes;
 
-    ret = usb_submit_urb(urb, GFP_ATOMIC);
-    if (ret < 0)
-        pr_err("simcom_audio: failed to resubmit capture URB: %d\n", ret);
-    else
-        pr_info("simcom_audio: capture URB resubmitted, next_off=%u len=%u\n", ctx->offset, period_bytes);
-
+    /* Resubmit immediately to avoid device overflow */
     spin_unlock_irqrestore(&chip->lock, flags);
+    usb_submit_urb(urb, GFP_ATOMIC);
 }
 
 /* ========================================================= */
@@ -285,6 +446,7 @@ static int simcom_audio_create_playback_urbs(struct simcom_audio *chip)
         ctx->substream = chip->playback_substream;
         initial_offset = (i * period_bytes) % buffer_bytes;
         ctx->offset = initial_offset;
+        INIT_DELAYED_WORK(&ctx->submit_work, simcom_playback_submit_work_fn);
 
         /* Allocate coherent buffer for USB transfer and prefill first period */
         ctx->buf = usb_alloc_coherent(chip->udev, period_bytes, GFP_KERNEL, &ctx->dma);
@@ -327,6 +489,8 @@ static int simcom_audio_create_capture_urbs(struct simcom_audio *chip)
         ctx->substream = chip->capture_substream;
         initial_offset = (i * period_bytes) % buffer_bytes;
         ctx->offset = initial_offset;
+        ctx->accum_len = 0;
+        INIT_DELAYED_WORK(&ctx->submit_work, simcom_capture_submit_work_fn);
 
         /* Allocate coherent buffer for USB transfer */
         ctx->buf = usb_alloc_coherent(chip->udev, period_bytes, GFP_KERNEL, &ctx->dma);
@@ -383,6 +547,7 @@ static int simcom_playback_close(struct snd_pcm_substream *substream)
     if (chip->playback_running) {
         chip->playback_running = 0;
         for (i = 0; i < NUM_URBS; i++) {
+            cancel_delayed_work_sync(&chip->urb_out_ctx[i].submit_work);
             if (chip->urb_out[i])
                 usb_kill_urb(chip->urb_out[i]);
         }
@@ -406,6 +571,7 @@ static int simcom_playback_prepare(struct snd_pcm_substream *substream)
 
     /* Reset hardware frames counter */
     chip->playback_hw_frames = 0;
+    chip->playback_period_bytes = 640;
 
     ret = simcom_audio_create_playback_urbs(chip);
     if (ret < 0) {
@@ -434,24 +600,24 @@ static int simcom_playback_trigger(struct snd_pcm_substream *substream, int cmd)
     switch (cmd) {
     case SNDRV_PCM_TRIGGER_START:
         chip->playback_running = 1;
-        
-    for (i = 0; i < NUM_URBS; i++) {
-        if (chip->urb_out[i]) {
-            pr_info("simcom_audio: submitting playback URB %d\n", i);
-            ret = usb_submit_urb(chip->urb_out[i], GFP_ATOMIC);
-            if (ret < 0) {
-                pr_err("simcom_audio: failed to submit playback URB %d: %d\n", i, ret);
-                break;
-            } else {
-                pr_info("simcom_audio: playback URB %d submitted successfully\n", i);
-            }
+        chip->last_playback_time = jiffies;
+        /* Запускаем только первый URB для строгих 40мс 640-байт пакетов */
+        if (chip->urb_out[0]) {
+            pr_info("simcom_audio: submitting playback URB 0\n");
+            ret = usb_submit_urb(chip->urb_out[0], GFP_ATOMIC);
+            if (ret < 0)
+                pr_err("simcom_audio: failed to submit playback URB 0: %d\n", ret);
+            else
+                pr_info("simcom_audio: playback URB 0 submitted successfully\n");
         }
-    }
-    pr_info("simcom_audio: playback started\n");
+        pr_info("simcom_audio: playback started\n");
         break;
 
     case SNDRV_PCM_TRIGGER_STOP:
         chip->playback_running = 0;
+        // Останавливаем отложенные задания
+        for (i = 0; i < NUM_URBS; i++)
+            cancel_delayed_work_sync(&chip->urb_out_ctx[i].submit_work);
         // Только устанавливаем флаг, URBs остановим позже
         pr_info("simcom_audio: playback stopped (flag set)\n");
         break;
@@ -493,6 +659,7 @@ static int simcom_capture_close(struct snd_pcm_substream *substream)
     if (chip->capture_running) {
         chip->capture_running = 0;
         for (i = 0; i < NUM_URBS; i++) {
+            cancel_delayed_work_sync(&chip->urb_in_ctx[i].submit_work);
             if (chip->urb_in[i])
                 usb_kill_urb(chip->urb_in[i]);
         }
@@ -515,6 +682,7 @@ static int simcom_capture_prepare(struct snd_pcm_substream *substream)
 
     /* Reset hardware frames counter */
     chip->capture_hw_frames = 0;
+    chip->capture_period_bytes = 1600;
 
     ret = simcom_audio_create_capture_urbs(chip);
     if (ret < 0) {
@@ -540,22 +708,24 @@ static int simcom_capture_trigger(struct snd_pcm_substream *substream, int cmd)
     switch (cmd) {
     case SNDRV_PCM_TRIGGER_START:
         chip->capture_running = 1;
-        
-        for (i = 0; i < NUM_URBS; i++) {
-            if (chip->urb_in[i]) {
-                ret = usb_submit_urb(chip->urb_in[i], GFP_ATOMIC);
-                if (ret < 0) {
-                    pr_err("simcom_audio: failed to submit capture URB: %d\n", ret);
-                    break;
-                }
-            }
+        chip->last_capture_time = jiffies;
+        /* Submit only the first capture URB to maintain strict 100ms cadence */
+        if (chip->urb_in[0]) {
+            pr_info("simcom_audio: submitting capture URB 0\n");
+            ret = usb_submit_urb(chip->urb_in[0], GFP_ATOMIC);
+            if (ret < 0)
+                pr_err("simcom_audio: failed to submit capture URB 0: %d\n", ret);
+            else
+                pr_info("simcom_audio: capture URB 0 submitted successfully\n");
         }
         pr_info("simcom_audio: capture started\n");
         break;
 
     case SNDRV_PCM_TRIGGER_STOP:
         chip->capture_running = 0;
-        // Только устанавливаем флаг, URBs остановим позже
+        // Останавливаем отложенные задания
+        for (i = 0; i < NUM_URBS; i++)
+            cancel_delayed_work_sync(&chip->urb_in_ctx[i].submit_work);
         pr_info("simcom_audio: capture stopped (flag set)\n");
         break;
 
@@ -570,7 +740,22 @@ static int simcom_capture_trigger(struct snd_pcm_substream *substream, int cmd)
 static int simcom_pcm_hw_params(struct snd_pcm_substream *substream,
                                struct snd_pcm_hw_params *hw_params)
 {
-    return snd_pcm_lib_malloc_pages(substream, 
+    struct simcom_audio *chip = snd_pcm_substream_chip(substream);
+    unsigned int period_bytes = params_period_bytes(hw_params);
+
+    if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+        if (period_bytes != 640)
+            return -EINVAL;
+        if (chip)
+            chip->playback_period_bytes = 640;
+    } else {
+        if (period_bytes != 1600)
+            return -EINVAL;
+        if (chip)
+            chip->capture_period_bytes = 1600;
+    }
+
+    return snd_pcm_lib_malloc_pages(substream,
                                    params_buffer_bytes(hw_params));
 }
 
@@ -601,6 +786,7 @@ static int simcom_pcm_hw_free(struct snd_pcm_substream *substream)
             msleep(20);
             /* Now free buffers (marking as freed first) and URBs */
             for (i = 0; i < NUM_URBS; i++) {
+                cancel_delayed_work_sync(&chip->urb_out_ctx[i].submit_work);
                 /* Mark buffer as freed before deallocation */
                 if (chip->urb_out_ctx[i].buf) {
                     void *buf = chip->urb_out_ctx[i].buf;
@@ -624,6 +810,7 @@ static int simcom_pcm_hw_free(struct snd_pcm_substream *substream)
             msleep(20);
             /* Now free buffers (marking as freed first) and URBs */
             for (i = 0; i < NUM_URBS; i++) {
+                cancel_delayed_work_sync(&chip->urb_in_ctx[i].submit_work);
                 /* Mark buffer as freed before deallocation */
                 if (chip->urb_in_ctx[i].buf) {
                     void *buf = chip->urb_in_ctx[i].buf;
