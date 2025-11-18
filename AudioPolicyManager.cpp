@@ -43,6 +43,7 @@
 #include <unordered_set>
 #include <string>
 #include <vector>
+#include <unistd.h>
 #include <AudioPolicyManagerInterface.h>
 #include <AudioPolicyEngineInstance.h>
 #include <cutils/properties.h>
@@ -261,6 +262,10 @@ status_t AudioPolicyManager::setDeviceConnectionStateInt(audio_devices_t deviceT
         }
 
         if (mEngine->getPhoneState() == AUDIO_MODE_IN_CALL && hasPrimaryOutput()) {
+            if (state == AUDIO_POLICY_DEVICE_STATE_AVAILABLE &&
+                    deviceType == AUDIO_DEVICE_OUT_TELEPHONY_TX) {
+                usleep(5000);
+            }
             DeviceVector newDevices = getNewOutputDevices(mPrimaryOutput, false /*fromCache*/);
             updateCallRouting(newDevices);
         }
@@ -352,6 +357,10 @@ status_t AudioPolicyManager::setDeviceConnectionStateInt(audio_devices_t deviceT
         updateDevicesAndOutputs();
 
         if (mEngine->getPhoneState() == AUDIO_MODE_IN_CALL && hasPrimaryOutput()) {
+            if (state == AUDIO_POLICY_DEVICE_STATE_AVAILABLE &&
+                    deviceType == AUDIO_DEVICE_IN_TELEPHONY_RX) {
+                usleep(5000);
+            }
             DeviceVector newDevices = getNewOutputDevices(mPrimaryOutput, false /*fromCache*/);
             updateCallRouting(newDevices);
         }
@@ -705,6 +714,17 @@ uint32_t AudioPolicyManager::updateCallRouting(const DeviceVector &rxDevices, ui
 
     bool needRxPatch = createRxPatch;
     bool needTxPatch = createTxPatch;
+    if (inCallMode && mCallRxPatch == 0 && mCallTxPatch == 0) {
+        ALOGI("SIMCOM updateCallRouting: first call routing - forcing RX/TX patches");
+        if (rxSourceDevice != nullptr && rxSinkDevice != nullptr) {
+            createRxPatch = true;
+            needRxPatch = true;
+        }
+        if (txSourceDevice != nullptr && txSinkDevice != nullptr) {
+            createTxPatch = true;
+            needTxPatch = true;
+        }
+    }
     if (createRxPatch) {
         if (isTelephonyPatchActive(true, rxSinkDevice)) {
             ALOGI("SIMCOM: reusing existing RX patch for %s",
@@ -937,6 +957,14 @@ sp<AudioPatch> AudioPolicyManager::createTelephonyPatch(
               outputDevice != nullptr ? outputDevice->toString().c_str() : "null", isRx);
     }
 
+    if (isRx && output != AUDIO_IO_HANDLE_NONE && device != nullptr) {
+        AudioParameter routeParam;
+        routeParam.addInt(String8(AudioParameter::keyRouting), (int)device->type());
+        ALOGI("SIMCOM: Forcing route activation via setParameters: io=%d params=%s",
+              output, routeParam.toString().c_str());
+        mpClientInterface->setParameters(output, routeParam.toString());
+    }
+
     audio_patch_handle_t afPatchHandle = AUDIO_PATCH_HANDLE_NONE;
     const struct audio_patch *patch = patchBuilder.patch();
     ALOGI("SIMCOM: createTelephonyPatch() calling createAudioPatch: isRx=%d patch num_sources=%u num_sinks=%u",
@@ -1050,6 +1078,15 @@ void AudioPolicyManager::setPhoneState(audio_mode_t state)
     ALOGI("SIMCOM setPhoneState: old=%d new=%d force=%d outputs=%zu primary=%p",
           oldState, state, force, mOutputs.size(),
           hasPrimaryOutput() ? mPrimaryOutput.get() : nullptr);
+
+    if (state == AUDIO_MODE_IN_CALL && hasPrimaryOutput()) {
+        usleep(10000);
+        DeviceVector immediateDevices = getNewOutputDevices(mPrimaryOutput, false /*fromCache*/);
+        ALOGI("SIMCOM setPhoneState: IN_CALL immediate device update -> %s",
+              immediateDevices.toString().c_str());
+        setOutputDevices(mPrimaryOutput, immediateDevices, true /*force*/, 0 /*delayMs*/);
+        updateCallRouting(immediateDevices, 0);
+    }
 
     // check for device and output changes triggered by new phone state
     checkForDeviceAndOutputChanges();
