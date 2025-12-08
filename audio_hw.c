@@ -49,14 +49,38 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <poll.h>
+#include <termios.h>
+#include <stdbool.h>
 #define SNDRV_CARDS 8
 #define SNDRV_DEVICES 8
+#define SIMCOM_TX_FALLBACK_PROP   "persist.vendor.simcom.force_fallback_tx"
+
+static inline bool simcom_tx_fallback_enabled(void)
+{
+    return property_get_bool(SIMCOM_TX_FALLBACK_PROP, true);
+}
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define SND_CARDS_NODE          "/proc/asound/cards"
 #define SIMCOM_CARD_ID_STRING   "SIMCOM"
 #define SIMCOM_PCM_CARD_FALLBACK 0
 #define SIMCOM_PCM_DEVICE       0
+#define SIMCOM_AT_DEVICE_PATH    "/dev/ttyUSB3"
+#define SIMCOM_PCM_READY_PROP    "vendor.simcom.pcm_ready"
+#define SIMCOM_CPCM_DELAY_PROP   "persist.vendor.simcom.cpcmreg_delay_ms"
+#define SIMCOM_CPCM_TIMEOUT_PROP "persist.vendor.simcom.cpcmreg_timeout_ms"
+#define SIMCOM_PCM_WAIT_PROP     "persist.vendor.simcom.cpcmreg_wait_ms"
+#define SIMCOM_CPCM_DEFAULT_DELAY_MS    3000
+#define SIMCOM_CPCM_DEFAULT_TIMEOUT_MS  2000
+#define SIMCOM_PCM_WAIT_DEFAULT_MS      6000
+#define SIMCOM_POLL_STEP_MS      100
+#define SIMCOM_CPCM_WRITE_RETRIES       3
+#define SIMCOM_CPCM_WRITE_RETRY_DELAY_US 200000
+#define SIMCOM_DUMP_RX_PROP      "persist.vendor.simcom.dump_rx"
+#define SIMCOM_DUMP_TX_PROP      "persist.vendor.simcom.dump_tx"
+#define SIMCOM_RX_DUMP_PATH      "/data/misc/audioserver/simcom_rx_dump.pcm"
+#define SIMCOM_TX_DUMP_PATH      "/data/misc/audioserver/simcom_tx_dump.pcm"
 #define OUT_SIMCOM_PCM(out)  ((out)->dev->simcom_tx_pcm)
 #define IN_SIMCOM_PCM(in)    ((in)->dev->simcom_rx_pcm)
 #define SIMCOM_TX_TARGET_RATE     8000
@@ -69,6 +93,353 @@ static int simcom_prepare_tx_resampler(struct stream_out *out, uint32_t in_rate,
 static bool simcom_force_patch_enabled(void)
 {
     return property_get_bool("persist.vendor.audio.simcom.force_patch", false);
+}
+
+struct simcom_cpcm_task {
+    struct audio_device *adev;
+    bool enable;
+};
+
+static void simcom_update_pcm_ready(struct audio_device *adev, bool ready)
+{
+    if (!adev) {
+        return;
+    }
+    pthread_mutex_lock(&adev->simcom_modem_lock);
+    adev->simcom_pcm_ready = ready;
+    pthread_mutex_unlock(&adev->simcom_modem_lock);
+    property_set(SIMCOM_PCM_READY_PROP, ready ? "1" : "0");
+    ALOGI("SIMCOM: PCM ready flag -> %d", ready);
+}
+
+static int simcom_open_at_port(void)
+{
+    int fd = open(SIMCOM_AT_DEVICE_PATH, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) {
+        ALOGE("SIMCOM: failed to open %s (%s)", SIMCOM_AT_DEVICE_PATH, strerror(errno));
+        return -errno;
+    }
+
+    struct termios cfg;
+    if (tcgetattr(fd, &cfg) != 0) {
+        ALOGE("SIMCOM: tcgetattr failed (%s)", strerror(errno));
+        close(fd);
+        return -errno;
+    }
+
+    cfmakeraw(&cfg);
+    cfsetispeed(&cfg, B115200);
+    cfsetospeed(&cfg, B115200);
+    cfg.c_cflag |= (CLOCAL | CREAD);
+
+    if (tcsetattr(fd, TCSANOW, &cfg) != 0) {
+        ALOGE("SIMCOM: tcsetattr failed (%s)", strerror(errno));
+        close(fd);
+        return -errno;
+    }
+
+    tcflush(fd, TCIOFLUSH);
+    return fd;
+}
+
+static int simcom_send_cpcmreg_command(bool enable, int timeout_ms)
+{
+    int fd = simcom_open_at_port();
+    if (fd < 0) {
+        return fd;
+    }
+
+    const char *cmd = enable ? "AT+CPCMREG=1\r" : "AT+CPCMREG=0\r";
+    ssize_t written = -1;
+    int retries = SIMCOM_CPCM_WRITE_RETRIES;
+    while (retries-- >= 0) {
+        written = write(fd, cmd, strlen(cmd));
+        if (written >= 0) {
+            break;
+        }
+        if ((errno == EAGAIN || errno == EWOULDBLOCK) && retries >= 0) {
+            ALOGW("SIMCOM: write '%s' got EAGAIN, retrying (%d)", cmd, retries);
+            usleep(SIMCOM_CPCM_WRITE_RETRY_DELAY_US);
+            continue;
+        }
+        ALOGE("SIMCOM: write '%s' failed (%s)", cmd, strerror(errno));
+        close(fd);
+        return -errno;
+    }
+    if (written < 0) {
+        ALOGE("SIMCOM: write '%s' exhausted retries", cmd);
+        close(fd);
+        return -errno;
+    }
+
+    char response[128] = {0};
+    size_t resp_len = 0;
+    int remaining = timeout_ms > 0 ? timeout_ms : SIMCOM_CPCM_DEFAULT_TIMEOUT_MS;
+
+    while (remaining > 0 && resp_len < sizeof(response) - 1) {
+        struct pollfd pfd = {
+            .fd = fd,
+            .events = POLLIN,
+        };
+        int polled = poll(&pfd, 1, remaining < SIMCOM_POLL_STEP_MS ? remaining : SIMCOM_POLL_STEP_MS);
+        if (polled < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ALOGE("SIMCOM: poll failed (%s)", strerror(errno));
+            break;
+        } else if (polled == 0) {
+            remaining -= SIMCOM_POLL_STEP_MS;
+            continue;
+        }
+
+        if (pfd.revents & POLLIN) {
+            ssize_t r = read(fd, response + resp_len, sizeof(response) - 1 - resp_len);
+            if (r > 0) {
+                resp_len += r;
+                response[resp_len] = '\0';
+                if (strstr(response, "OK")) {
+                    close(fd);
+                    ALOGI("SIMCOM: '%s' acknowledged by modem", cmd);
+                    return 0;
+                }
+                if (strstr(response, "ERROR")) {
+                    ALOGE("SIMCOM: '%s' rejected: %s", cmd, response);
+                    close(fd);
+                    return -EIO;
+                }
+            }
+        }
+    }
+
+    ALOGE("SIMCOM: timeout waiting for response to '%s' (resp='%s')", cmd, response);
+    close(fd);
+    return -ETIMEDOUT;
+}
+
+static void *simcom_cpcm_worker(void *opaque)
+{
+    struct simcom_cpcm_task *task = (struct simcom_cpcm_task *)opaque;
+    if (!task || !task->adev) {
+        ALOGE("SIMCOM: cpcm_worker: invalid task");
+        free(task);
+        return NULL;
+    }
+
+    struct audio_device *adev = task->adev;
+    const bool enable = task->enable;
+    free(task);
+
+    ALOGI("SIMCOM: cpcm_worker started: enable=%d", enable ? 1 : 0);
+
+    if (enable) {
+        int delay_ms = property_get_int32(SIMCOM_CPCM_DELAY_PROP, SIMCOM_CPCM_DEFAULT_DELAY_MS);
+        if (delay_ms > 0) {
+            ALOGI("SIMCOM: delaying AT+CPCMREG=1 by %d ms", delay_ms);
+            usleep(delay_ms * 1000);
+        }
+    }
+
+    int timeout_ms = property_get_int32(SIMCOM_CPCM_TIMEOUT_PROP, SIMCOM_CPCM_DEFAULT_TIMEOUT_MS);
+    ALOGI("SIMCOM: cpcm_worker: sending AT+CPCMREG=%d (timeout=%d ms)", enable ? 1 : 0, timeout_ms);
+    int ret = simcom_send_cpcmreg_command(enable, timeout_ms);
+    if (ret != 0) {
+        ALOGE("SIMCOM: AT+CPCMREG=%d failed ret=%d", enable ? 1 : 0, ret);
+    } else {
+        ALOGI("SIMCOM: AT+CPCMREG=%d succeeded", enable ? 1 : 0);
+    }
+
+    simcom_update_pcm_ready(adev, enable && (ret == 0));
+    ALOGI("SIMCOM: cpcm_worker finished: pcm_ready=%d", (enable && (ret == 0)) ? 1 : 0);
+    return NULL;
+}
+
+static void simcom_schedule_cpcm_command(struct audio_device *adev, bool enable)
+{
+    if (!adev) {
+        ALOGW("SIMCOM: simcom_schedule_cpcm_command called with NULL adev");
+        return;
+    }
+
+    ALOGI("SIMCOM: simcom_schedule_cpcm_command: enable=%d (current voice_call_active=%d)", 
+          enable ? 1 : 0, adev->voice_call_active ? 1 : 0);
+
+    if (enable) {
+        simcom_update_pcm_ready(adev, false);
+    }
+
+    struct simcom_cpcm_task *task = (struct simcom_cpcm_task *)calloc(1, sizeof(*task));
+    if (!task) {
+        ALOGE("SIMCOM: failed to allocate cpcm task");
+        return;
+    }
+    task->adev = adev;
+    task->enable = enable;
+
+    pthread_t thread_id;
+    int ret = pthread_create(&thread_id, NULL, simcom_cpcm_worker, task);
+    if (ret != 0) {
+        ALOGE("SIMCOM: pthread_create failed (%s)", strerror(ret));
+        free(task);
+        return;
+    }
+    pthread_detach(thread_id);
+    ALOGI("SIMCOM: simcom_schedule_cpcm_command: worker thread started for AT+CPCMREG=%d", enable ? 1 : 0);
+}
+
+static bool simcom_is_pcm_ready(struct audio_device *adev)
+{
+    if (!adev) {
+        return false;
+    }
+    pthread_mutex_lock(&adev->simcom_modem_lock);
+    bool ready = adev->simcom_pcm_ready;
+    pthread_mutex_unlock(&adev->simcom_modem_lock);
+    return ready;
+}
+
+static bool simcom_wait_for_pcm_ready(struct audio_device *adev)
+{
+    int wait_ms = property_get_int32(SIMCOM_PCM_WAIT_PROP, SIMCOM_PCM_WAIT_DEFAULT_MS);
+    if (wait_ms <= 0) {
+        return simcom_is_pcm_ready(adev);
+    }
+
+    int waited = 0;
+    while (waited < wait_ms) {
+        if (simcom_is_pcm_ready(adev)) {
+            return true;
+        }
+        usleep(SIMCOM_POLL_STEP_MS * 1000);
+        waited += SIMCOM_POLL_STEP_MS;
+    }
+    return simcom_is_pcm_ready(adev);
+}
+
+static bool simcom_voice_mode_active(struct audio_device *adev);
+
+static uint32_t simcom_select_voice_playback_route(audio_devices_t devices)
+{
+    if (devices & AUDIO_DEVICE_OUT_ALL_SCO) {
+        return BLUETOOTH_INCALL_ROUTE;
+    }
+    if ((devices & AUDIO_DEVICE_OUT_SPEAKER) &&
+        (devices & (AUDIO_DEVICE_OUT_WIRED_HEADPHONE | AUDIO_DEVICE_OUT_WIRED_HEADSET))) {
+        return SPEAKER_HEADPHONE_INCALL_ROUTE;
+    }
+    if (devices & AUDIO_DEVICE_OUT_WIRED_HEADSET) {
+        return HEADSET_INCALL_ROUTE;
+    }
+    if (devices & AUDIO_DEVICE_OUT_WIRED_HEADPHONE) {
+        return HEADPHONE_INCALL_ROUTE;
+    }
+    if (devices & AUDIO_DEVICE_OUT_EARPIECE) {
+        return EARPIECE_INCALL_ROUTE;
+    }
+    if (devices & AUDIO_DEVICE_OUT_SPEAKER) {
+        return SPEAKER_INCALL_ROUTE;
+    }
+    return SPEAKER_INCALL_ROUTE;
+}
+
+static uint32_t simcom_select_voice_capture_route(audio_devices_t devices)
+{
+    if (devices & AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET) {
+        return BLUETOOTH_SOC_MIC_CAPTURE_ROUTE;
+    }
+    if (devices & AUDIO_DEVICE_IN_WIRED_HEADSET) {
+        return HANDS_FREE_MIC_CAPTURE_ROUTE;
+    }
+    if (devices & AUDIO_DEVICE_IN_BACK_MIC) {
+        return HANDS_FREE_MIC_CAPTURE_ROUTE;
+    }
+    return MAIN_MIC_CAPTURE_ROUTE;
+}
+
+static void simcom_apply_voice_routes_l(struct audio_device *adev)
+{
+    if (!simcom_voice_mode_active(adev)) {
+        return;
+    }
+
+    audio_devices_t out_dev = adev->out_device;
+    if (out_dev == AUDIO_DEVICE_NONE) {
+        out_dev = AUDIO_DEVICE_OUT_SPEAKER;
+    }
+
+    uint32_t route = simcom_select_voice_playback_route(out_dev);
+    ALOGI("SIMCOM: simcom_apply_voice_routes_l: out_dev=0x%x route=%u", out_dev, route);
+    if (route == 0 ||
+        (adev->simcom_voice_playback_route == route &&
+         adev->simcom_forced_out_device == out_dev)) {
+        ALOGI("SIMCOM: simcom_apply_voice_routes_l: skipping (route==0 or already applied)");
+        return;
+    }
+
+    int card = adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card;
+    if (card < 0) {
+        ALOGW("SIMCOM: cannot apply voice route %u, invalid speaker card %d", route, card);
+        return;
+    }
+
+    ALOGI("SIMCOM: simcom_apply_voice_routes_l: calling route_pcm_card_open(card=%d, route=%u)", card, route);
+    route_pcm_card_open(card, route);
+    adev->simcom_voice_playback_route = route;
+    adev->simcom_forced_out_device = out_dev;
+    ALOGI("SIMCOM: applied voice playback route %u for devices=0x%x (card=%d)",
+          route, out_dev, card);
+
+    audio_devices_t in_dev = adev->in_device;
+    if (in_dev == AUDIO_DEVICE_NONE) {
+        in_dev = AUDIO_DEVICE_IN_BUILTIN_MIC;
+    }
+    uint32_t capture_route = simcom_select_voice_capture_route(in_dev);
+    if (capture_route != 0 &&
+        (capture_route != adev->simcom_voice_capture_route ||
+         adev->simcom_forced_in_device != in_dev)) {
+        int in_card = adev->dev_in[SND_IN_SOUND_CARD_MIC].card;
+        if (in_card < 0) {
+            in_card = adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card;
+        }
+        if (in_card >= 0) {
+            route_pcm_card_open(in_card, capture_route);
+            adev->simcom_voice_capture_route = capture_route;
+            adev->simcom_forced_in_device = in_dev;
+            ALOGI("SIMCOM: applied voice capture route %u for devices=0x%x (card=%d)",
+                  capture_route, in_dev, in_card);
+        } else {
+            ALOGW("SIMCOM: cannot apply voice capture route %u, invalid mic card %d",
+                  capture_route, in_card);
+        }
+    }
+}
+
+static void simcom_reset_voice_routes_l(struct audio_device *adev)
+{
+    ALOGI("SIMCOM: simcom_reset_voice_routes_l called (playback_route=%d capture_route=%d)", 
+          adev->simcom_voice_playback_route, adev->simcom_voice_capture_route);
+    if (adev->simcom_voice_playback_route != 0) {
+        int card = adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card;
+        if (card >= 0) {
+            // SIMCOM: Apply SPEAKER_NORMAL_ROUTE to reset mixer
+            route_pcm_card_open(card, SPEAKER_NORMAL_ROUTE);
+            ALOGI("SIMCOM: cleared voice playback route, applied SPEAKER_NORMAL_ROUTE (card=%d)", card);
+        }
+        adev->simcom_voice_playback_route = 0;
+        adev->simcom_forced_out_device = AUDIO_DEVICE_NONE;
+    }
+    if (adev->simcom_voice_capture_route != 0) {
+        int in_card = adev->dev_in[SND_IN_SOUND_CARD_MIC].card;
+        if (in_card < 0) {
+            in_card = adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card;
+        }
+        if (in_card >= 0) {
+            route_pcm_card_open(in_card, CAPTURE_OFF_ROUTE);
+            ALOGI("SIMCOM: cleared voice capture route (card=%d)", in_card);
+        }
+        adev->simcom_voice_capture_route = 0;
+        adev->simcom_forced_in_device = AUDIO_DEVICE_NONE;
+    }
 }
 
 static void simcom_rx_bus_init(struct simcom_rx_bus *bus)
@@ -91,8 +462,11 @@ static void simcom_rx_bus_reset(struct audio_device *adev)
     bus->frame_bytes = 0;
     bus->frame_gen = 0;
     bus->pending_consumers = 0;
+    // SIMCOM: Clear buffer data to prevent stale data from previous call
+    memset(bus->frame_buf, 0, sizeof(bus->frame_buf));
     pthread_cond_broadcast(&bus->cond);
     pthread_mutex_unlock(&bus->lock);
+    ALOGI("SIMCOM: RX bus reset - buffer cleared");
 }
 
 static void simcom_rx_bus_drop_consumer(struct audio_device *adev)
@@ -228,6 +602,11 @@ static int simcom_acquire_tx_pcm(struct audio_device *adev, bool wait_for_device
         return -EINVAL;
     }
 
+    if (!simcom_wait_for_pcm_ready(adev)) {
+        ALOGW("SIMCOM: telephony TX requested before modem PCM ready");
+        return -EAGAIN;
+    }
+
     if (adev->simcom_tx_pcm) {
         adev->simcom_tx_users++;
         ALOGD("SIMCOM: telephony TX PCM reuse, users=%d", adev->simcom_tx_users);
@@ -258,7 +637,9 @@ static int simcom_acquire_tx_pcm(struct audio_device *adev, bool wait_for_device
         if (pcm_handle && pcm_is_ready(pcm_handle)) {
             adev->simcom_tx_pcm = pcm_handle;
             adev->simcom_tx_users = 1;
-            ALOGI("SIMCOM: telephony TX PCM ready on card %d device %d", card, device);
+            // SIMCOM: Prepare PCM to clear ALSA buffers and reset state
+            pcm_prepare(pcm_handle);
+            ALOGI("SIMCOM: telephony TX PCM ready on card %d device %d (prepared and cleared)", card, device);
             return 0;
         }
 
@@ -306,6 +687,11 @@ static int simcom_acquire_rx_pcm(struct audio_device *adev, bool wait_for_device
         return -EINVAL;
     }
 
+    if (!simcom_wait_for_pcm_ready(adev)) {
+        ALOGW("SIMCOM: telephony RX requested before modem PCM ready");
+        return -EAGAIN;
+    }
+
     if (adev->simcom_rx_pcm) {
         adev->simcom_rx_users++;
         ALOGD("SIMCOM: telephony RX PCM reuse, users=%d", adev->simcom_rx_users);
@@ -335,7 +721,9 @@ static int simcom_acquire_rx_pcm(struct audio_device *adev, bool wait_for_device
             adev->simcom_rx_pcm = pcm_handle;
             adev->simcom_rx_users = 1;
             simcom_rx_bus_reset(adev);
-            ALOGI("SIMCOM: telephony RX PCM ready on card %d device %d", card, device);
+            // SIMCOM: Prepare PCM to clear ALSA buffers and reset state
+            pcm_prepare(pcm_handle);
+            ALOGI("SIMCOM: telephony RX PCM ready on card %d device %d (prepared and cleared)", card, device);
             return 0;
         }
 
@@ -960,8 +1348,8 @@ static bool get_specified_out_dev(struct dev_info *devinfo,
             devinfo->device = device;
             ALOGD("%s card, got card=%d,device=%d", devinfo->id,
                   devinfo->card, devinfo->device);
-            return true;
-        }
+        return true;
+    }
     }
     return false;
 }
@@ -1368,11 +1756,6 @@ if (!hasExtCodec()){
     disable = is_multi_pcm(out) || is_bitstream(out);
 }
 
-    if (out->bypass_pcm) {
-        ALOGI("SIMCOM: voice call stream - AudioFlinger patch drives PCM (pcm=NULL enforced)");
-        return 0;
-    }
-
     if (out->is_simcom_voice) {
         if (!(out->device & AUDIO_DEVICE_OUT_TELEPHONY_TX)) {
             ALOGW("SIMCOM: telephony TX stream requested on non-Telephony device 0x%x, skipping pcm_open",
@@ -1398,7 +1781,7 @@ if (!hasExtCodec()){
         }
         ALOGE("SIMCOM: telephony TX PCM acquire failed ret=%d", ret);
         return ret;
-    }
+}
 
     ALOGD("%s:%d out = %p,device = 0x%x,outputs[OUTPUT_HDMI_MULTI] = %p",__FUNCTION__,__LINE__,out,out->device,adev->outputs[OUTPUT_HDMI_MULTI]);
     if (out == adev->outputs[OUTPUT_HDMI_MULTI]) {
@@ -1417,7 +1800,33 @@ if (!hasExtCodec()){
 }
 
     out_dump(out, 0);
-    route_pcm_card_open(adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card, getRouteFromDevice(out->device));
+    // SIMCOM: Activate route with voice call route if in call mode
+    uint32_t route;
+    if (adev->mode == AUDIO_MODE_IN_CALL && adev->voice_call_active) {
+        // SIMCOM: Use SPEAKER_HEADPHONE_INCALL_ROUTE if both speaker and headphone are selected
+        if ((out->device & AUDIO_DEVICE_OUT_SPEAKER) && 
+            (out->device & (AUDIO_DEVICE_OUT_WIRED_HEADPHONE | AUDIO_DEVICE_OUT_WIRED_HEADSET))) {
+            route = SPEAKER_HEADPHONE_INCALL_ROUTE;
+            ALOGI("SIMCOM: start_output_stream using SPEAKER_HEADPHONE_INCALL_ROUTE for device=0x%x", out->device);
+        } else if (out->device & AUDIO_DEVICE_OUT_SPEAKER) {
+            route = SPEAKER_INCALL_ROUTE;
+        } else if (out->device & AUDIO_DEVICE_OUT_WIRED_HEADPHONE) {
+            route = HEADPHONE_INCALL_ROUTE;
+        } else if (out->device & AUDIO_DEVICE_OUT_WIRED_HEADSET) {
+            route = HEADSET_INCALL_ROUTE;
+        } else {
+            route = getRouteFromDevice(out->device);
+        }
+        ALOGI("SIMCOM: start_output_stream activating voice route=%u for device=0x%x", route, out->device);
+    } else {
+        route = getRouteFromDevice(out->device);
+    }
+    ALOGI("SIMCOM: start_output_stream activating route=%u for device=0x%x (card=%d)", 
+          route, out->device, adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card);
+    route_pcm_card_open(adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card, route);
+
+    // SIMCOM: For bypass_pcm streams (voice call RX path), PCM is opened normally
+    // No special handling needed - just continue to open PCM devices below
 
     if (out->device & AUDIO_DEVICE_OUT_AUX_DIGITAL) {
         if (adev->owner[SOUND_CARD_HDMI] == NULL) {
@@ -1459,6 +1868,8 @@ if (!hasExtCodec()){
                        AUDIO_DEVICE_OUT_WIRED_HEADPHONE)) {
         card = adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card;
         device = adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].device;
+        ALOGI("SIMCOM: start_output_stream opening PCM for device=0x%x card=%d device_index=%d bypass_pcm=%d",
+              out->device, card, device, out->bypass_pcm ? 1 : 0);
         if(card != (int)SND_OUT_SOUND_CARD_UNKNOWN) {
 			if (out->device & (AUDIO_DEVICE_OUT_SPEAKER | AUDIO_DEVICE_OUT_WIRED_HEADSET |AUDIO_DEVICE_OUT_WIRED_HEADPHONE)) {	
             out->pcm[SND_OUT_SOUND_CARD_SPEAKER] = pcm_open(card, device,
@@ -1468,6 +1879,10 @@ if (!hasExtCodec()){
                       pcm_get_error(out->pcm[SND_OUT_SOUND_CARD_SPEAKER]),card);
                 pcm_close(out->pcm[SND_OUT_SOUND_CARD_SPEAKER]);
                 return -ENOMEM;
+            }
+            if (out->pcm[SND_OUT_SOUND_CARD_SPEAKER]) {
+                ALOGI("SIMCOM: PCM for speaker/headphone opened successfully (pcm=%p card=%d device=%d)",
+                      out->pcm[SND_OUT_SOUND_CARD_SPEAKER], card, device);
             }
         }
 			else{
@@ -1484,6 +1899,12 @@ if (!hasExtCodec()){
 			}
         }
 
+    }
+
+    // SIMCOM: For bypass_pcm streams, return early after opening PCM devices
+    if (out->bypass_pcm) {
+        ALOGI("SIMCOM: voice call stream - AudioFlinger patch drives PCM (pcm devices opened for playback)");
+        return 0;
     }
 
     if (out->device & AUDIO_DEVICE_OUT_SPDIF) {
@@ -1706,6 +2127,12 @@ static int start_input_stream(struct stream_in *in)
     }
 
     if (in->is_simcom_voice) {
+        // Reset audio detection state for new call
+        in->simcom_audio_detected = false;
+        in->simcom_silence_count = 0;
+        in->simcom_audio_confirm_count = 0;
+        ALOGD("SIMCOM: reset audio detection state for new call");
+        
         if (in->simcom_attached) {
             ALOGD("SIMCOM: telephony RX stream already attached");
             goto simcom_post_open;
@@ -2102,13 +2529,45 @@ if (!hasExtCodec()){
             adev->voice_api->flush();
         }
 #endif
+        // SIMCOM: Close mixer only if no active output devices remain
+        // This prevents interrupting playback when other streams are active
+        if (!adev->out_device) {
+            ALOGI("SIMCOM: do_out_standby: no active output devices, closing mixer");
         route_pcm_close(PLAYBACK_OFF_ROUTE);
         ALOGD("close device");
+        } else {
+            ALOGI("SIMCOM: do_out_standby: active output devices remain (0x%x), keeping mixer open",
+                  adev->out_device);
+        }
 
         /* Skip resetting the mixer if no output device is active */
-        if (adev->out_device) {
-            route_pcm_open(getRouteFromDevice(adev->out_device));
+        // SIMCOM: For normal playback (not voice call), activate route using route_pcm_card_open with correct sound card
+        if (adev->out_device && !(adev->mode == AUDIO_MODE_IN_CALL && adev->voice_call_active)) {
+            uint32_t route = getRouteFromDevice(adev->out_device);
+            ALOGI("SIMCOM: do_out_standby activating route=%u for device=0x%x (card=%d)", 
+                  route, adev->out_device, adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card);
+            route_pcm_card_open(adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card, route);
             ALOGD("change device");
+        } else if (adev->mode == AUDIO_MODE_IN_CALL && adev->voice_call_active) {
+            // SIMCOM: For voice call mode, use out->device instead of adev->out_device
+            uint32_t device_for_route = out->device;
+            if (device_for_route) {
+                uint32_t route;
+                // SIMCOM: Use voice call route if in call mode
+                if (device_for_route & AUDIO_DEVICE_OUT_SPEAKER) {
+                    route = SPEAKER_INCALL_ROUTE;
+                } else if (device_for_route & AUDIO_DEVICE_OUT_WIRED_HEADPHONE) {
+                    route = HEADPHONE_INCALL_ROUTE;
+                } else if (device_for_route & AUDIO_DEVICE_OUT_WIRED_HEADSET) {
+                    route = HEADSET_INCALL_ROUTE;
+                } else {
+                    route = getRouteFromDevice(device_for_route);
+                }
+                ALOGI("SIMCOM: do_out_standby using voice route=%u for device=0x%x (out->device=0x%x adev->out_device=0x%x)",
+                      route, device_for_route, out->device, adev->out_device);
+                route_pcm_card_open(adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card, route);
+            }
+            ALOGI("SIMCOM: do_out_standby route activated for voice call");
         }
 if (!hasExtCodec()){
         if(adev->owner[SOUND_CARD_HDMI] == (int*)out){
@@ -2271,8 +2730,17 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
             }
             out->device = val;
         }
+        
+        // SIMCOM: Don't update out_device during patch creation to avoid blocking
+        // Route will be activated in out_write() when first data is written
     }
     unlock_all_outputs(adev, NULL);
+
+    if (adev->mode == AUDIO_MODE_IN_CALL && adev->voice_call_active) {
+        pthread_mutex_lock(&adev->lock);
+        simcom_apply_voice_routes_l(adev);
+        pthread_mutex_unlock(&adev->lock);
+    }
 
     str_parms_destroy(parms);
 
@@ -2533,6 +3001,28 @@ static void dump_in_data(const void* buffer, size_t bytes)
     }
 }
 
+static void simcom_maybe_dump_buffer(bool is_rx, const void *buffer, size_t bytes)
+{
+    const char *prop = is_rx ? SIMCOM_DUMP_RX_PROP : SIMCOM_DUMP_TX_PROP;
+    const char *path = is_rx ? SIMCOM_RX_DUMP_PATH : SIMCOM_TX_DUMP_PATH;
+
+    if (!property_get_bool(prop, false)) {
+        return;
+    }
+
+    int fd = open(path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0666);
+    if (fd < 0) {
+        ALOGE("SIMCOM: failed to open dump file %s: %s", path, strerror(errno));
+        return;
+    }
+
+    ssize_t ret = write(fd, buffer, bytes);
+    if (ret < 0) {
+        ALOGE("SIMCOM: failed to write dump %s: %s", path, strerror(errno));
+    }
+    close(fd);
+}
+
 static void simcom_log_pcm_snapshot(const char *tag, const void *buffer, size_t bytes)
 {
     if (!buffer || bytes < sizeof(int16_t)) {
@@ -2563,6 +3053,98 @@ static void simcom_log_pcm_snapshot(const char *tag, const void *buffer, size_t 
 
     ALOGD("SIMCOM: %s PCM bytes=%zu samples=%zu peak=%d first/mid/last=%d/%d/%d zero=%d",
           tag, bytes, sample_count, peak, first, mid, last, all_zero);
+
+    bool is_rx = (strstr(tag, "RX") != NULL);
+    simcom_maybe_dump_buffer(is_rx, buffer, bytes);
+}
+
+// Threshold for detecting real audio vs silence (16-bit PCM, range -32768 to 32767)
+// Peak amplitude must exceed this to be considered real audio
+// Temporarily disabled to test if detection causes clicks
+#define SIMCOM_AUDIO_DETECT_THRESHOLD 50  // Lowered threshold to detect earlier
+// Number of consecutive non-silence buffers required to confirm audio detection
+#define SIMCOM_AUDIO_DETECT_CONFIRM_COUNT 3
+// Maximum silence buffers before resetting detection (to allow re-detection)
+#define SIMCOM_SILENCE_MAX_COUNT 100
+
+/**
+ * Detect if buffer contains real audio signal (not silence/zeros)
+ * Returns true if audio detected, false if silence
+ */
+static bool simcom_detect_real_audio(const void *buffer, size_t bytes)
+{
+    if (!buffer || bytes < sizeof(int16_t)) {
+        return false;
+    }
+
+    const int16_t *samples = (const int16_t *)buffer;
+    const size_t sample_count = bytes / sizeof(int16_t);
+    int16_t peak = 0;
+
+    // Check entire buffer for peak amplitude
+    for (size_t i = 0; i < sample_count; ++i) {
+        const int16_t abs_val = samples[i] < 0 ? -samples[i] : samples[i];
+        if (abs_val > peak) {
+            peak = abs_val;
+        }
+    }
+
+    // Consider real audio if peak exceeds threshold
+    return (peak >= SIMCOM_AUDIO_DETECT_THRESHOLD);
+}
+
+/**
+ * Update audio detection state for SIMCOM RX stream
+ * Returns true if real audio is confirmed (should pass through),
+ * false if still in silence period (should be suppressed)
+ */
+static bool simcom_update_audio_detection(struct stream_in *in, const void *buffer, size_t bytes)
+{
+    if (!in->is_simcom_voice) {
+        return true;  // Not SIMCOM voice stream, always pass through
+    }
+
+    // If audio already detected, check if we're back to silence
+    if (in->simcom_audio_detected) {
+        if (simcom_detect_real_audio(buffer, bytes)) {
+            in->simcom_silence_count = 0;
+            return true;  // Real audio confirmed, pass through
+        } else {
+            in->simcom_silence_count++;
+            // Allow brief silence periods but reset if too long
+            if (in->simcom_silence_count > SIMCOM_SILENCE_MAX_COUNT) {
+                ALOGI("SIMCOM: RX audio lost, resetting detection (silence_count=%u)",
+                      in->simcom_silence_count);
+                in->simcom_audio_detected = false;
+                in->simcom_silence_count = 0;
+                return false;
+            }
+            return true;  // Brief silence allowed, still pass through
+        }
+    }
+
+    // Audio not yet detected, check current buffer
+    if (simcom_detect_real_audio(buffer, bytes)) {
+        // Increment confirmation counter
+        in->simcom_audio_confirm_count++;
+        
+        if (in->simcom_audio_confirm_count >= SIMCOM_AUDIO_DETECT_CONFIRM_COUNT) {
+            // Audio confirmed, enable pass-through
+            in->simcom_audio_detected = true;
+            in->simcom_silence_count = 0;
+            in->simcom_audio_confirm_count = 0;
+            ALOGI("SIMCOM: RX real audio detected! Enabling playback (peak detected in %u buffers)",
+                  SIMCOM_AUDIO_DETECT_CONFIRM_COUNT);
+            return true;
+        }
+        // Need more confirmations
+        return false;
+    } else {
+        // Still silence, reset confirmation counter
+        in->simcom_audio_confirm_count = 0;
+        in->simcom_silence_count++;
+        return false;
+    }
 }
 
 static int simcom_ensure_tx_resampler_buffer(struct stream_out *out, size_t frames, size_t channels)
@@ -2610,17 +3192,21 @@ static void simcom_release_tx_resampler(struct stream_out *out)
         release_resampler(out->simcom_resampler);
         out->simcom_resampler = NULL;
     }
+    // SIMCOM: Clear buffers before freeing to prevent stale data
     if (out->simcom_resampler_buffer) {
+        memset(out->simcom_resampler_buffer, 0, out->simcom_resampler_buffer_size);
         free(out->simcom_resampler_buffer);
         out->simcom_resampler_buffer = NULL;
         out->simcom_resampler_buffer_size = 0;
     }
     if (out->simcom_mono_buffer) {
+        memset(out->simcom_mono_buffer, 0, out->simcom_mono_buffer_size);
         free(out->simcom_mono_buffer);
         out->simcom_mono_buffer = NULL;
         out->simcom_mono_buffer_size = 0;
     }
     out->simcom_resampler_in_rate = 0;
+    ALOGD("SIMCOM: TX resampler and buffers released and cleared");
 }
 
 static int simcom_prepare_tx_resampler(struct stream_out *out, uint32_t in_rate, size_t channels)
@@ -2855,13 +3441,47 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
     }
 false_alarm:
 
-    // Для Telephony устройств в patch mode данные передаются через патч AudioFlinger
-    // HAL не должен открывать PCM напрямую, но должен передавать данные через stream
+    // SIMCOM: Log out_write entry for debugging (only first call and when bypass_pcm changes)
+    // Removed frequent logging to avoid system overload
+
+    // SIMCOM: Для bypass_pcm потоков (voice call RX path) данные приходят через патч AudioFlinger
+    // Нужно записать эти данные в PCM для динамика/гарнитуры для воспроизведения
     if (out->bypass_pcm) {
-        // В patch mode AudioFlinger управляет PCM, HAL просто передает данные
-        // Устанавливаем ret = 0 для успешной записи (bytes будет возвращен в конце функции)
-        ALOGD("SIMCOM: bypass_pcm out_write: %zu bytes passed through AudioFlinger patch", bytes);
-        ret = 0;  // Успех - данные будут переданы через патч AudioFlinger
+        // Для voice call RX path: данные из модема → PCM для динамика/гарнитуры
+        if (out->device & (AUDIO_DEVICE_OUT_SPEAKER |
+                           AUDIO_DEVICE_OUT_WIRED_HEADSET |
+                           AUDIO_DEVICE_OUT_WIRED_HEADPHONE)) {
+            // SIMCOM: Check data from patch before writing
+            int16_t *patch_data = (int16_t *)buffer;
+            size_t patch_samples = bytes / sizeof(int16_t);
+            int16_t patch_peak = 0;
+            for (size_t s = 0; s < patch_samples && s < 100; s++) {
+                int16_t val = patch_data[s] < 0 ? -patch_data[s] : patch_data[s];
+                if (val > patch_peak) patch_peak = val;
+            }
+            ALOGI("SIMCOM: bypass_pcm data from patch: bytes=%zu peak=%d device=0x%x rate=%u channels=%u",
+                  bytes, patch_peak, out->device, out->config.rate, out->config.channels);
+            
+            if (out->pcm[SND_OUT_SOUND_CARD_SPEAKER] != NULL && 
+                pcm_is_ready(out->pcm[SND_OUT_SOUND_CARD_SPEAKER])) {
+                ret = pcm_write(out->pcm[SND_OUT_SOUND_CARD_SPEAKER], buffer, bytes);
+                if (ret) {
+                    ALOGW("SIMCOM: bypass_pcm pcm_write to speaker failed ret=%d err=%s",
+                          ret, pcm_get_error(out->pcm[SND_OUT_SOUND_CARD_SPEAKER]));
+                    ret = 0; // Non-fatal, continue
+                } else {
+                    ALOGV("SIMCOM: bypass_pcm out_write: %zu bytes written to speaker PCM", bytes);
+                }
+            } else {
+                ALOGW("SIMCOM: bypass_pcm out_write: speaker PCM not ready (pcm=%p), dropping %zu bytes",
+                      out->pcm[SND_OUT_SOUND_CARD_SPEAKER], bytes);
+                ret = 0;
+            }
+        } else {
+            ALOGD("SIMCOM: bypass_pcm out_write: %zu bytes passed through AudioFlinger patch (device=0x%x)",
+                  bytes, out->device);
+            ret = 0;
+        }
         goto exit;
     }
 
@@ -2921,7 +3541,8 @@ if (!hasExtCodec()){
             goto exit;
         }
 
-        if (simcom_voice_mode_active(adev) && !out->is_simcom_voice &&
+        if (simcom_voice_mode_active(adev) && simcom_tx_fallback_enabled() &&
+                !out->is_simcom_voice &&
                 buffer != NULL && bytes > 0) {
             pthread_mutex_lock(&adev->lock);
             if (adev->simcom_tx_pcm == NULL) {
@@ -2940,24 +3561,9 @@ if (!hasExtCodec()){
                 }
                 const int16_t *tx_src = (const int16_t *)buffer;
                 size_t tx_frames = bytes / (in_channels * sizeof(int16_t));
-                int resample_ret = simcom_prepare_tx_resampler(out, in_rate, in_channels);
-                if (resample_ret == 0 && out->simcom_resampler != NULL && tx_frames > 0) {
-                    size_t tmp_in = tx_frames;
-                    size_t tmp_out = (size_t)(((uint64_t)tx_frames * SIMCOM_TX_TARGET_RATE) / in_rate) + 1;
-                    if (simcom_ensure_tx_resampler_buffer(out, tmp_out, in_channels) == 0) {
-                        out->simcom_resampler->resample_from_input(out->simcom_resampler,
-                                                                   (int16_t *)tx_src, &tmp_in,
-                                                                   out->simcom_resampler_buffer,
-                                                                   &tmp_out);
-                        tx_src = out->simcom_resampler_buffer;
-                        tx_frames = tmp_out;
-                    } else {
-                        tx_frames = 0;
-                    }
-                } else if (resample_ret != 0 && in_rate != SIMCOM_TX_TARGET_RATE) {
-                    ALOGW("SIMCOM: TX resampler unavailable for rate %u, skipping modem feed", in_rate);
-                    tx_frames = 0;
-                }
+                size_t tx_channels = in_channels;
+                
+                // SIMCOM: Step 1 - Convert to mono first (before resampling for efficiency)
                 if (tx_frames > 0 && in_channels > 1) {
                     if (simcom_ensure_tx_mono_buffer(out, tx_frames) == 0) {
                         int16_t *mono = out->simcom_mono_buffer;
@@ -2969,17 +3575,56 @@ if (!hasExtCodec()){
                             mono[f] = (int16_t)(acc / (int32_t)in_channels);
                         }
                         tx_src = mono;
+                        tx_channels = 1; // Now mono
                     } else {
                         tx_frames = 0;
                     }
                 }
+                
+                // SIMCOM: Step 2 - Resample mono signal (more efficient than resampling stereo)
+                if (tx_frames > 0 && in_rate != SIMCOM_TX_TARGET_RATE) {
+                    int resample_ret = simcom_prepare_tx_resampler(out, in_rate, tx_channels);
+                    if (resample_ret == 0 && out->simcom_resampler != NULL) {
+                        size_t tmp_in = tx_frames;
+                        size_t tmp_out = (size_t)(((uint64_t)tx_frames * SIMCOM_TX_TARGET_RATE) / in_rate) + 1;
+                        if (simcom_ensure_tx_resampler_buffer(out, tmp_out, tx_channels) == 0) {
+                            out->simcom_resampler->resample_from_input(out->simcom_resampler,
+                                                                       (int16_t *)tx_src, &tmp_in,
+                                                                       out->simcom_resampler_buffer,
+                                                                       &tmp_out);
+                            tx_src = out->simcom_resampler_buffer;
+                            tx_frames = tmp_out;
+                        } else {
+                            tx_frames = 0;
+                        }
+                    } else if (resample_ret != 0) {
+                        ALOGW("SIMCOM: TX resampler unavailable for rate %u->%u, skipping modem feed", 
+                              in_rate, SIMCOM_TX_TARGET_RATE);
+                        tx_frames = 0;
+                    }
+                }
                 if (tx_frames > 0) {
-                    size_t tx_bytes = tx_frames * sizeof(int16_t);
-                    simcom_log_pcm_snapshot("TX->modem (fallback)", tx_src, tx_bytes);
-                    int tx_ret = pcm_write(adev->simcom_tx_pcm, tx_src, tx_bytes);
-                    if (tx_ret) {
-                        ALOGE("SIMCOM: fallback pcm_write failed ret=%d err=%s",
-                              tx_ret, pcm_get_error(adev->simcom_tx_pcm));
+                    // SIMCOM: Check PCM readiness before write to avoid blocking/deadlock
+                    if (!pcm_is_ready(adev->simcom_tx_pcm)) {
+                        ALOGW("SIMCOM: TX PCM not ready, skipping write. Error: %s",
+                              pcm_get_error(adev->simcom_tx_pcm));
+                        // Try to reacquire PCM device
+                        pthread_mutex_lock(&adev->lock);
+                        if (adev->simcom_tx_pcm) {
+                            pcm_close(adev->simcom_tx_pcm);
+                            adev->simcom_tx_pcm = NULL;
+                        }
+                        simcom_acquire_tx_pcm(adev, false);
+                        pthread_mutex_unlock(&adev->lock);
+                    } else {
+                        size_t tx_bytes = tx_frames * sizeof(int16_t);
+                        simcom_log_pcm_snapshot("TX->modem (fallback)", tx_src, tx_bytes);
+                        int tx_ret = pcm_write(adev->simcom_tx_pcm, tx_src, tx_bytes);
+                        if (tx_ret < 0) {
+                            ALOGW("SIMCOM: fallback pcm_write failed ret=%d err=%s (non-fatal, continuing)",
+                                  tx_ret, pcm_get_error(adev->simcom_tx_pcm));
+                            // Don't block on PCM write errors - continue with main stream
+                        }
                     }
                 }
             }
@@ -2988,6 +3633,15 @@ if (!hasExtCodec()){
         out_mute_data(out,(void*)buffer,bytes);
         dump_out_data(buffer, bytes);
         ret = -1;
+        // SIMCOM: Log when writing to speaker PCM for voice call
+        if (adev->mode == AUDIO_MODE_IN_CALL && 
+            out->device & (AUDIO_DEVICE_OUT_SPEAKER | AUDIO_DEVICE_OUT_WIRED_HEADSET | AUDIO_DEVICE_OUT_WIRED_HEADPHONE)) {
+            if (out->pcm[SND_OUT_SOUND_CARD_SPEAKER]) {
+                ALOGI("SIMCOM: out_write voice call RX: device=0x%x bytes=%zu pcm=%p ready=%d",
+                      out->device, bytes, out->pcm[SND_OUT_SOUND_CARD_SPEAKER],
+                      pcm_is_ready(out->pcm[SND_OUT_SOUND_CARD_SPEAKER]) ? 1 : 0);
+            }
+        }
         for (i = 0; i < SND_OUT_SOUND_CARD_MAX; i++)
             if (out->pcm[i]) {
 #ifdef BT_AP_SCO
@@ -3020,9 +3674,35 @@ if (!hasExtCodec()){
                         continue;
                     }
 }
+                    // SIMCOM: Log pcm_write for voice call to diagnose audio issues
+                    if (adev->mode == AUDIO_MODE_IN_CALL && 
+                        i == SND_OUT_SOUND_CARD_SPEAKER) {
+                        int16_t *data = (int16_t *)buffer;
+                        size_t samples = bytes / sizeof(int16_t);
+                        int16_t peak = 0;
+                        for (size_t s = 0; s < samples && s < 100; s++) {
+                            int16_t val = data[s] < 0 ? -data[s] : data[s];
+                            if (val > peak) peak = val;
+                        }
+                        ALOGI("SIMCOM: pcm_write to speaker: card=%d device=%d bytes=%zu rate=%u channels=%u format=%u pcm=%p peak=%d",
+                              adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card,
+                              adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].device,
+                              bytes, out->config.rate, out->config.channels, out->config.format,
+                              out->pcm[i], peak);
+}
                     ret = pcm_write(out->pcm[i], (void *)buffer, bytes);
-                    if (ret != 0)
+                    if (ret != 0) {
+                        if (adev->mode == AUDIO_MODE_IN_CALL && 
+                            i == SND_OUT_SOUND_CARD_SPEAKER) {
+                            ALOGE("SIMCOM: pcm_write to speaker failed: ret=%d err=%s",
+                                  ret, pcm_get_error(out->pcm[i]));
+                        }
                         break;
+                    } else if (adev->mode == AUDIO_MODE_IN_CALL && 
+                               i == SND_OUT_SOUND_CARD_SPEAKER) {
+                        // SIMCOM: Log successful pcm_write for voice call
+                        ALOGV("SIMCOM: pcm_write to speaker succeeded: bytes=%zu ret=%d", bytes, ret);
+                    }
                 }
             }
     }
@@ -3250,8 +3930,8 @@ static void do_in_standby(struct stream_in *in)
             in->pcm = NULL;
             in->simcom_attached = false;
         } else {
-            pcm_close(in->pcm);
-            in->pcm = NULL;
+        pcm_close(in->pcm);
+        in->pcm = NULL;
         }
 
         if (in->device & AUDIO_DEVICE_IN_HDMI) {
@@ -3264,6 +3944,20 @@ static void do_in_standby(struct stream_in *in)
         in->standby = true;
         route_pcm_close(CAPTURE_OFF_ROUTE);
         in->simcom_rx_last_gen = 0;
+        
+        // Reset audio detection state when going to standby
+        if (in->is_simcom_voice) {
+            in->simcom_audio_detected = false;
+            in->simcom_silence_count = 0;
+            in->simcom_audio_confirm_count = 0;
+        }
+        
+        // SIMCOM: Clear resampler buffer to prevent stale data
+        if (in->buffer) {
+            memset(in->buffer, 0, pcm_frames_to_bytes(in->pcm, in->config->period_size));
+            ALOGD("SIMCOM: cleared input resampler buffer");
+        }
+        in->frames_in = 0;
     }
 
 }
@@ -3492,6 +4186,15 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
     struct audio_device *adev = in->dev;
     size_t frames_rq = bytes / audio_stream_in_frame_size(stream);
 
+    // SIMCOM: Log in_read entry for telephony RX streams
+    if (in->is_simcom_voice) {
+        static int log_counter = 0;
+        if ((log_counter++ % 50) == 0) { // Log every 50th call to avoid spam
+            ALOGI("SIMCOM: in_read called: is_simcom_voice=1 bypass_pcm=%d standby=%d bytes=%zu device=0x%x",
+                  in->bypass_pcm ? 1 : 0, in->standby ? 1 : 0, bytes, in->device);
+        }
+    }
+
     if (in->device & AUDIO_DEVICE_IN_HDMI) {
         unsigned int rate = get_hdmiin_audio_rate(adev);
         if(rate != in->config->rate){
@@ -3545,6 +4248,8 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
                 in->pcm = IN_SIMCOM_PCM(in);
                 ALOGI("SIMCOM: in_read re-attached RX PCM (pcm=%p users=%d)",
                       IN_SIMCOM_PCM(in), adev->simcom_rx_users);
+            } else {
+                ALOGW("SIMCOM: in_read failed to acquire RX PCM (ret=%d)", attach_ret);
             }
             pthread_mutex_unlock(&adev->lock);
         }
@@ -3558,13 +4263,18 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
             ret = bytes;
             goto exit;
         }
+        
+        // SIMCOM: Log PCM readiness for RX
+        if (IN_SIMCOM_PCM(in) && !pcm_is_ready(IN_SIMCOM_PCM(in))) {
+            ALOGW("SIMCOM: in_read RX PCM not ready: %s", pcm_get_error(IN_SIMCOM_PCM(in)));
+        }
     }
 
     int retry = 0;
     do {
-        ret = read_frames(in, buffer, frames_rq);
+    ret = read_frames(in, buffer, frames_rq);
         if (ret >= 0) {
-            ret = 0;
+        ret = 0;
             break;
         }
 
@@ -3595,6 +4305,37 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
         usleep(SIMCOM_RX_READ_RETRY_US);
     } while (true);
 
+    // SIMCOM RX: Detect real audio and suppress zeros during call establishment
+    // Temporarily disable detection to test if it causes clicks
+    // TODO: Re-enable after fixing resampling/fragmentation issue
+    /*
+    if (in->is_simcom_voice && buffer && bytes > 0 && ret == 0) {
+        bool should_pass_through = simcom_update_audio_detection(in, buffer, bytes);
+        
+        if (!should_pass_through) {
+            // Audio not yet detected or in silence period, suppress zeros
+            memset(buffer, 0, bytes);
+            
+            // Log detection state periodically
+            static int log_counter = 0;
+            if ((log_counter++ % 100) == 0) {
+                ALOGD("SIMCOM: RX audio detection: detected=%d confirm=%u silence=%u (suppressing zeros)",
+                      in->simcom_audio_detected ? 1 : 0,
+                      in->simcom_audio_confirm_count,
+                      in->simcom_silence_count);
+            }
+        } else {
+            // Real audio confirmed, log periodically
+            static int log_counter = 0;
+            if ((log_counter++ % 200) == 0) {
+                ALOGD("SIMCOM: RX audio confirmed, passing through");
+            }
+        }
+        
+        simcom_log_pcm_snapshot("RX<-modem", buffer, bytes);
+    }
+    */
+    // Log RX data without blocking
     if (in->is_simcom_voice && buffer && bytes > 0) {
         simcom_log_pcm_snapshot("RX<-modem", buffer, bytes);
     }
@@ -3883,15 +4624,16 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
     bool telephony_tx = (devices & AUDIO_DEVICE_OUT_TELEPHONY_TX);
     bool call_mode_active = simcom_voice_mode_active(adev);
     bool force_patch = simcom_force_patch_enabled();
+    bool voip_rx_flag = (flags & AUDIO_OUTPUT_FLAG_VOIP_RX);
+    bool telephony_voice_stream = telephony_tx || voip_rx_flag;
 
     ALOGD("audio hal adev_open_output_stream devices = 0x%x, flags = %d, samplerate = %d,format = 0x%x",
           devices, flags, config->sample_rate,config->format);
 
-    if (devices & AUDIO_DEVICE_OUT_TELEPHONY_TX) {
-        type = OUTPUT_SIMCOM_VOICE;
-    }
-
-    if (telephony_tx || call_mode_active) {
+    if (telephony_voice_stream || call_mode_active) {
+        if (telephony_voice_stream) {
+            type = OUTPUT_SIMCOM_VOICE;
+        }
         if (telephony_tx && !adev->simcom_card_available) {
             ALOGW("SIMCOM: telephony TX requested but SIMCOM device not detected");
         }
@@ -3916,8 +4658,17 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
     out->supported_sample_rates[2] = 8000;
 
     out->is_simcom_voice = telephony_tx;
-    out->bypass_pcm = force_patch && call_mode_active && !telephony_tx;
+    out->bypass_pcm = (force_patch && call_mode_active && !telephony_tx);
+    if (voip_rx_flag) {
+        out->bypass_pcm = true;
+    }
     out->simcom_attached = false;
+    
+    // SIMCOM: Log bypass_pcm setting for voice call streams (always log, not just when call_mode_active)
+    ALOGI("SIMCOM: adev_open_output_stream: force_patch=%d call_mode_active=%d telephony_tx=%d voip_rx=%d bypass_pcm=%d device=0x%x adev->mode=%d adev->voice_call_active=%d",
+          force_patch ? 1 : 0, call_mode_active ? 1 : 0, telephony_tx ? 1 : 0,
+          voip_rx_flag ? 1 : 0, out->bypass_pcm ? 1 : 0,
+          devices, adev->mode, adev->voice_call_active ? 1 : 0);
 
     if (telephony_tx && force_patch) {
         ALOGI("SIMCOM: Telephony Tx requested - NO PCM in adev_open (patch mode)");
@@ -3926,8 +4677,10 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
     } else if (telephony_tx) {
         ALOGI("SIMCOM: Telephony Tx requested - direct PCM mode (force_patch disabled)");
     } else if (call_mode_active && force_patch) {
-        ALOGI("SIMCOM: Voice call active, bypassing PCM for non-telephony output");
-        memset(out->pcm, 0, sizeof(out->pcm));
+        // SIMCOM: For bypass_pcm streams (voice call RX path), PCM will be opened in start_output_stream
+        // Don't zero PCM here - it needs to be opened for speaker/headphone playback
+        ALOGI("SIMCOM: Voice call active, bypass_pcm=true - PCM will be opened in start_output_stream for playback");
+        // Do NOT zero PCM - it will be opened for speaker/headphone output
     }
 
     if(config != NULL)
@@ -4135,9 +4888,9 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
         } else if (!is_telephony_new) {
             // Новый stream НЕ Telephony, а существующий занят - блокируем
             ALOGD("SIMCOM: blocking non-Telephony stream, outputs[%d] already in use", type);
-            pthread_mutex_unlock(&adev->lock_outputs);
-            ret = -EBUSY;
-            goto err_open;
+        pthread_mutex_unlock(&adev->lock_outputs);
+        ret = -EBUSY;
+        goto err_open;
         } else {
             // Новый Telephony, но существующий НЕ Telephony - это не должно происходить, но разрешаем
             ALOGW("SIMCOM: replacing non-Telephony stream with Telephony in outputs[%d]", type);
@@ -4273,13 +5026,32 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
             } else {
                 adev->voice_call_active = true;
                 ALOGI("SIMCOM: voice call flag set");
+                if (adev->mode == AUDIO_MODE_IN_CALL) {
+                    simcom_apply_voice_routes_l(adev);
+                }
             }
         } else if (!strcmp(value, "stop")) {
             adev->voice_call_active = false;
             ALOGI("SIMCOM: voice call flag cleared");
+            simcom_reset_voice_routes_l(adev);
         } else {
             ALOGW("SIMCOM: unknown simcom_voice_call value: %s", value);
             status = -EINVAL;
+        }
+    }
+
+    ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING,
+                            value, sizeof(value));
+    if (ret < 0) {
+        ret = str_parms_get_str(parms, "routing", value, sizeof(value));
+    }
+    if (ret >= 0) {
+        audio_devices_t routed_dev = (audio_devices_t)atoi(value);
+        if (routed_dev != 0) {
+            adev->out_device = routed_dev;
+            if (simcom_voice_mode_active(adev)) {
+                simcom_apply_voice_routes_l(adev);
+            }
         }
     }
 
@@ -4429,16 +5201,71 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
 
     ALOGD("Audio mode changing: %d -> %d, SIMCOM available: %d, call active: %d",
           previous, mode, adev->simcom_card_available, adev->voice_call_active);
+    
+    // SIMCOM: Detailed logging for mode changes
+    if (mode == AUDIO_MODE_IN_CALL) {
+        ALOGI("SIMCOM: adev_set_mode: ENTERING IN_CALL mode (previous=%d)", previous);
+    } else if (previous == AUDIO_MODE_IN_CALL && mode != AUDIO_MODE_IN_CALL) {
+        ALOGI("SIMCOM: adev_set_mode: EXITING IN_CALL mode (new=%d)", mode);
+    }
+    
+    pthread_mutex_lock(&adev->lock);
     adev->mode = mode;
 
-    if (now_call && !adev->voice_call_active) {
-        adev->voice_call_active = true;
-        ALOGI("SIMCOM: entered call mode, enabling voice flag for fallback path");
+    if (now_call) {
+        // SIMCOM: Always reset PCM ready and send AT+CPCMREG=1 when entering call mode
+        // This ensures the modem is properly initialized even if voice_call_active was already true
+        if (!adev->voice_call_active) {
+            ALOGI("SIMCOM: entered call mode, enabling voice flag for fallback path");
+            adev->voice_call_active = true;
+        } else {
+            ALOGI("SIMCOM: already in call mode, resetting PCM ready and re-sending AT+CPCMREG=1");
+        }
+        simcom_schedule_cpcm_command(adev, true);
+        
+        // SIMCOM: Ensure sound cards are initialized before applying voice routes
+        // This prevents "invalid speaker card -1" error on subsequent calls
+        if (adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card < 0) {
+            // Force re-scan of sound cards
+            ALOGI("SIMCOM: speaker card not initialized (card=%d), forcing re-scan",
+                  adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card);
+            
+            // Manually scan for RT5651 codec (card=2)
+            FILE *fp = fopen("/proc/asound/card2/id", "r");
+            if (fp) {
+                char id[32];
+                if (fgets(id, sizeof(id), fp)) {
+                    if (strstr(id, "realtekrt5651co")) {
+                        adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card = 2;
+                        adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].device = 0;
+                        ALOGI("SIMCOM: manually initialized speaker card=2 device=0");
+                    }
+                }
+                fclose(fp);
+            }
+        }
+        
+        // Apply voice routes if speaker card is now valid
+        if (adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card >= 0) {
+            simcom_apply_voice_routes_l(adev);
+        } else {
+            ALOGW("SIMCOM: speaker card still invalid, voice routes not applied");
+        }
     } else if (!now_call && adev->voice_call_active) {
-        ALOGI("SIMCOM: exited call mode, clearing voice flag");
+        ALOGI("SIMCOM: exited call mode, clearing voice flag (previous=%d new=%d)",
+              previous, mode);
         adev->voice_call_active = false;
+        simcom_schedule_cpcm_command(adev, false);
+        simcom_reset_voice_routes_l(adev);
+    } else {
+        ALOGD("SIMCOM: adev_set_mode: no action needed (now_call=%d voice_call_active=%d)", 
+              now_call ? 1 : 0, adev->voice_call_active ? 1 : 0);
+        if (!now_call) {
+            simcom_reset_voice_routes_l(adev);
+        }
     }
 
+    pthread_mutex_unlock(&adev->lock);
     return 0;
 }
 
@@ -4523,6 +5350,8 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     bool telephony_rx = (devices & AUDIO_DEVICE_IN_TELEPHONY_RX);
     bool call_mode_active = simcom_voice_mode_active(adev);
 
+    ALOGI("SIMCOM: adev_open_input_stream: devices=0x%x telephony_rx=%d call_mode_active=%d flags=%d rate=%d channels=0x%x",
+           devices, telephony_rx ? 1 : 0, call_mode_active ? 1 : 0, flags, config->sample_rate, config->channel_mask);
     ALOGD("audio hal adev_open_input_stream devices = 0x%x, flags = %d, config->samplerate = %d,config->channel_mask = %x",
            devices, flags, config->sample_rate,config->channel_mask);
 
@@ -4578,9 +5407,11 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     in->bypass_pcm = call_mode_active && !telephony_rx;
     in->simcom_attached = false;
     if (telephony_rx) {
-        ALOGI("SIMCOM: Telephony Rx input - dedicated SIMCOM PCM stream");
+        ALOGI("SIMCOM: Telephony Rx input - dedicated SIMCOM PCM stream (bypass_pcm=false)");
         in->bypass_pcm = false;
     }
+    ALOGI("SIMCOM: adev_open_input_stream: is_simcom_voice=%d bypass_pcm=%d standby=%d",
+          in->is_simcom_voice ? 1 : 0, in->bypass_pcm ? 1 : 0, in->standby ? 1 : 0);
 
     in->standby = true;
     in->requested_rate = config->sample_rate;
@@ -4763,6 +5594,8 @@ static int adev_close(hw_device_t *device)
 
     //audio_route_free(adev->ar);
     route_uninit();
+    property_set(SIMCOM_PCM_READY_PROP, "0");
+    pthread_mutex_destroy(&adev->simcom_modem_lock);
 
     free(device);
     return 0;
@@ -4810,6 +5643,10 @@ static void adev_open_init(struct audio_device *adev)
     adev->simcom_card_available = false;
     adev->simcom_pcm_card = -1;
     adev->simcom_pcm_device = SIMCOM_PCM_DEVICE;
+    adev->simcom_forced_out_device = AUDIO_DEVICE_NONE;
+    adev->simcom_voice_playback_route = 0;
+    adev->simcom_forced_in_device = AUDIO_DEVICE_NONE;
+    adev->simcom_voice_capture_route = 0;
 }
 
 /**
@@ -4861,6 +5698,10 @@ static int adev_open(const hw_module_t* module, const char* name,
     /* adev->cur_route_id initial value is 0 and such that first device
      * selection is always applied by select_devices() */
     *device = &adev->hw_device.common;
+
+    pthread_mutex_init(&adev->simcom_modem_lock, NULL);
+    adev->simcom_pcm_ready = false;
+    property_set(SIMCOM_PCM_READY_PROP, "0");
 
     adev_open_init(adev);
     adev->simcom_card_available = simcom_detect_card(adev);

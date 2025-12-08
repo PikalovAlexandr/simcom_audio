@@ -760,6 +760,11 @@ protected:
         audio_io_handle_t mSimcomVoiceInputHandle;
         audio_port_handle_t mSimcomVoiceDeviceId;
         input_type_t mSimcomVoiceInputType;
+        bool mSimcomTxPatchBlocked = false;
+        DeviceVector mSimcomLastVoiceRxDevices;
+        audio_port_handle_t mSimcomVoiceOutputPortId = AUDIO_PORT_HANDLE_NONE;
+        audio_io_handle_t mSimcomVoiceOutputHandle = AUDIO_IO_HANDLE_NONE;
+        audio_port_handle_t mSimcomVoiceOutputDeviceId = AUDIO_PORT_HANDLE_NONE;
 
         uint32_t nextAudioPortGeneration();
 
@@ -775,6 +780,12 @@ private:
         void simcomHandleVoiceCallInput(bool enable);
         void simcomReleaseVoiceCallInput();
         bool isSimcomForceStartInputEnabled() const;
+        bool waitForSimcomPcmReady(uint32_t timeoutMs) const;
+        DeviceVector simcomFilterTelephonyDevices(const DeviceVector &devices) const;
+        DeviceVector simcomResolveCallRxDevices(const DeviceVector &requestedDevices);
+        status_t simcomEnsureVoiceCallOutput(const sp<DeviceDescriptor> &device,
+                                             bool *openedNewOutput = nullptr);
+        void simcomReleaseVoiceCallOutput();
 
         // Add or remove AC3 DTS encodings based on user preferences.
         void modifySurroundFormats(const sp<DeviceDescriptor>& devDesc, FormatVector *formatsPtr);

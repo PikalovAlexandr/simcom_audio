@@ -340,6 +340,12 @@ struct audio_device {
     int simcom_tx_users;
     int simcom_rx_users;
     struct simcom_rx_bus simcom_rx_bus;
+    bool simcom_pcm_ready;
+    pthread_mutex_t simcom_modem_lock;
+    audio_devices_t simcom_forced_out_device;
+    uint32_t simcom_voice_playback_route;
+    audio_devices_t simcom_forced_in_device;
+    uint32_t simcom_voice_capture_route;
 };
 
 struct stream_out {
@@ -433,6 +439,10 @@ struct stream_in {
     bool bypass_pcm;
     bool simcom_attached;
     uint32_t simcom_rx_last_gen;
+    // Audio detection for call establishment period
+    bool simcom_audio_detected;          // True when real audio signal detected
+    uint32_t simcom_silence_count;       // Count of consecutive silence buffers
+    uint32_t simcom_audio_confirm_count; // Count of consecutive audio buffers for confirmation
 };
 
 #define STRING_TO_ENUM(string) { #string, string }

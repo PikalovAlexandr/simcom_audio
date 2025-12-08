@@ -44,6 +44,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <android/log.h>
 #include <AudioPolicyManagerInterface.h>
 #include <AudioPolicyEngineInstance.h>
 #include <cutils/properties.h>
@@ -82,6 +83,11 @@ static constexpr const char kSimcomForceStartInputProp[] =
         "persist.vendor.simcom.force_startinput";
 static constexpr const char kSimcomForcePatchProp[] =
         "persist.vendor.audio.simcom.force_patch";
+static constexpr const char kSimcomPcmReadyProp[] =
+        "vendor.simcom.pcm_ready";
+static constexpr const char kSimcomPcmWaitProp[] =
+        "persist.vendor.simcom.cpcmreg_wait_ms";
+static constexpr uint32_t kSimcomDefaultPcmWaitMs = 6000;
 
 // ----------------------------------------------------------------------------
 // AudioPolicyInterface implementation
@@ -513,7 +519,12 @@ status_t AudioPolicyManager::getHwOffloadEncodingFormatsSupportedForA2DP(
 
 uint32_t AudioPolicyManager::updateCallRouting(const DeviceVector &rxDevices, uint32_t delayMs)
 {
-    ALOGI("SIMCOM updateCallRouting: rxDevices=%zu delayMs=%u", rxDevices.size(), delayMs);
+    DeviceVector effectiveRxDevices = simcomResolveCallRxDevices(rxDevices);
+    if (effectiveRxDevices.isEmpty()) {
+        effectiveRxDevices = rxDevices;
+    }
+    ALOGW("SIMCOM updateCallRouting: requestedRxDevices=%zu effectiveRxDevices=%zu delayMs=%u",
+          rxDevices.size(), effectiveRxDevices.size(), delayMs);
     bool createTxPatch = false;
     bool createRxPatch = false;
     uint32_t muteWaitMs = 0;
@@ -535,14 +546,18 @@ uint32_t AudioPolicyManager::updateCallRouting(const DeviceVector &rxDevices, ui
     if(!hasPrimaryOutput() || mPrimaryOutput->devices().types() == AUDIO_DEVICE_OUT_STUB) {
         return muteWaitMs;
     }
-    ALOG_ASSERT(!rxDevices.isEmpty(), "updateCallRouting() no selected output device");
+    ALOG_ASSERT(!effectiveRxDevices.isEmpty(), "updateCallRouting() no selected output device");
 
     audio_attributes_t attr = { .source = AUDIO_SOURCE_VOICE_COMMUNICATION };
     auto txSourceDevice = mEngine->getInputDeviceForAttributes(attr);
     ALOG_ASSERT(txSourceDevice != 0, "updateCallRouting() input selected device not available");
 
-    sp<DeviceDescriptor> rxSinkDevice = rxDevices.itemAt(0);
+    sp<DeviceDescriptor> rxSinkDevice = effectiveRxDevices.itemAt(0);
     const bool inCallMode = (mEngine->getPhoneState() == AUDIO_MODE_IN_CALL);
+    if (!inCallMode && mSimcomTxPatchBlocked) {
+        ALOGI("SIMCOM updateCallRouting: clearing TX patch block (not in call mode)");
+        mSimcomTxPatchBlocked = false;
+    }
     ALOGV("updateCallRouting device rxDevice %s txDevice %s",
           rxSinkDevice->toString().c_str(), txSourceDevice->toString().c_str());
 
@@ -693,6 +708,8 @@ uint32_t AudioPolicyManager::updateCallRouting(const DeviceVector &rxDevices, ui
             txSinkDevice->type() == AUDIO_DEVICE_OUT_TELEPHONY_TX;
     createRxPatch = baseRxPatch;
     createTxPatch = baseTxPatch;
+    const bool simcomForcePatch =
+            property_get_bool(kSimcomForcePatchProp, false);
 
     if (telephonyDevicesDetected && inCallMode) {
         if (!createRxPatch) {
@@ -705,11 +722,31 @@ uint32_t AudioPolicyManager::updateCallRouting(const DeviceVector &rxDevices, ui
         }
     }
 
-    if (property_get_bool(kSimcomForcePatchProp, false) &&
-            inCallMode) {
+    if (simcomForcePatch && inCallMode) {
         ALOGI("SIMCOM: force_patch property enabled, overriding patch creation");
         createRxPatch = true;
         createTxPatch = true;
+    }
+
+    if (inCallMode && (createRxPatch || createTxPatch)) {
+        const int waitProp = property_get_int32(
+                kSimcomPcmWaitProp, static_cast<int32_t>(kSimcomDefaultPcmWaitMs));
+        if (waitProp > 0 && !property_get_bool(kSimcomPcmReadyProp, false)) {
+            ALOGI("SIMCOM updateCallRouting: waiting up to %d ms for modem PCM readiness",
+                  waitProp);
+            if (!waitForSimcomPcmReady(waitProp)) {
+                ALOGW("SIMCOM updateCallRouting: modem not ready after %d ms", waitProp);
+            } else {
+                ALOGI("SIMCOM updateCallRouting: modem signaled PCM ready");
+            }
+        }
+    }
+
+    if (mSimcomTxPatchBlocked && inCallMode && !simcomForcePatch) {
+        if (createTxPatch) {
+            ALOGW("SIMCOM: previous TX patch failure, skipping telephony TX patch for this call");
+        }
+        createTxPatch = false;
     }
 
     bool needRxPatch = createRxPatch;
@@ -751,7 +788,7 @@ uint32_t AudioPolicyManager::updateCallRouting(const DeviceVector &rxDevices, ui
     // Use legacy routing method for voice calls via setOutputDevice() on primary output.
     // Otherwise, create two audio patches for TX and RX path.
     if (!createRxPatch) {
-        muteWaitMs = setOutputDevices(mPrimaryOutput, rxDevices, true, delayMs);
+        muteWaitMs = setOutputDevices(mPrimaryOutput, effectiveRxDevices, true, delayMs);
     } else if (needRxPatch) { // create RX path audio patch
         sp<AudioPatch> rxPatch = createTelephonyPatch(true /*isRx*/, rxSinkDevice, delayMs);
         if (rxPatch != 0 && rxSinkDevice != nullptr) {
@@ -760,7 +797,7 @@ uint32_t AudioPolicyManager::updateCallRouting(const DeviceVector &rxDevices, ui
         } else {
             ALOGW("SIMCOM updateCallRouting: RX patch creation failed, fallback to legacy routing");
             createRxPatch = false;
-            muteWaitMs = setOutputDevices(mPrimaryOutput, rxDevices, true, delayMs);
+            muteWaitMs = setOutputDevices(mPrimaryOutput, effectiveRxDevices, true, delayMs);
         }
     } else {
         ALOGI("SIMCOM updateCallRouting: RX patch already active, skip recreate");
@@ -777,9 +814,17 @@ uint32_t AudioPolicyManager::updateCallRouting(const DeviceVector &rxDevices, ui
         if (txPatch != 0 && txSourceDevice != nullptr) {
             mCallTxPatch = txPatch;
             mCallTxDeviceId = txSourceDevice->getId();
+            if (mSimcomTxPatchBlocked) {
+                ALOGI("SIMCOM updateCallRouting: TX patch succeeded, clearing block flag");
+            }
+            mSimcomTxPatchBlocked = false;
         } else {
             ALOGW("SIMCOM updateCallRouting: TX patch creation failed (txSource=%s)",
                   txSourceDevice != nullptr ? txSourceDevice->toString().c_str() : "<null>");
+            if (inCallMode && !simcomForcePatch) {
+                mSimcomTxPatchBlocked = true;
+                ALOGW("SIMCOM updateCallRouting: disabling TX patch attempts for current call");
+            }
         }
     } else if (createTxPatch) {
         ALOGI("SIMCOM updateCallRouting: TX patch already active, skip recreate");
@@ -795,6 +840,79 @@ uint32_t AudioPolicyManager::updateCallRouting(const DeviceVector &rxDevices, ui
 
 bool AudioPolicyManager::isSimcomForceStartInputEnabled() const {
     return property_get_bool(kSimcomForceStartInputProp, false);
+}
+
+bool AudioPolicyManager::waitForSimcomPcmReady(uint32_t timeoutMs) const {
+    if (timeoutMs == 0) {
+        return property_get_bool(kSimcomPcmReadyProp, false);
+    }
+
+    const uint32_t pollStepMs = 50;
+    const nsecs_t deadline = systemTime(SYSTEM_TIME_MONOTONIC) +
+            milliseconds_to_nanoseconds(timeoutMs);
+    while (systemTime(SYSTEM_TIME_MONOTONIC) < deadline) {
+        if (property_get_bool(kSimcomPcmReadyProp, false)) {
+            return true;
+        }
+        usleep(pollStepMs * 1000);
+    }
+    return property_get_bool(kSimcomPcmReadyProp, false);
+}
+
+DeviceVector AudioPolicyManager::simcomFilterTelephonyDevices(const DeviceVector &devices) const {
+    DeviceVector filtered;
+    for (size_t i = 0; i < devices.size(); ++i) {
+        sp<DeviceDescriptor> device = devices.itemAt(i);
+        if (device != nullptr && device->type() != AUDIO_DEVICE_OUT_TELEPHONY_TX) {
+            filtered.add(device);
+        }
+    }
+    return filtered;
+}
+
+DeviceVector AudioPolicyManager::simcomResolveCallRxDevices(
+        const DeviceVector &requestedDevices) {
+    DeviceVector filtered = simcomFilterTelephonyDevices(requestedDevices);
+    if (!filtered.isEmpty()) {
+        mSimcomLastVoiceRxDevices = filtered;
+        return filtered;
+    }
+
+    if (!mSimcomLastVoiceRxDevices.isEmpty()) {
+        ALOGI("SIMCOM updateCallRouting: reusing cached physical RX devices=%s",
+              mSimcomLastVoiceRxDevices.toString().c_str());
+        return mSimcomLastVoiceRxDevices;
+    }
+
+    DeviceVector fallback;
+    if (hasPrimaryOutput() && mPrimaryOutput != nullptr) {
+        fallback = simcomFilterTelephonyDevices(mPrimaryOutput->devices());
+    }
+
+    if (fallback.isEmpty()) {
+        static const audio_devices_t kPreferredMask =
+                AUDIO_DEVICE_OUT_EARPIECE |
+                AUDIO_DEVICE_OUT_WIRED_HEADSET |
+                AUDIO_DEVICE_OUT_WIRED_HEADPHONE |
+                AUDIO_DEVICE_OUT_SPEAKER |
+                AUDIO_DEVICE_OUT_BLUETOOTH_SCO |
+                AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET |
+                AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT;
+        DeviceVector preferred = mAvailableOutputDevices.getDevicesFromTypeMask(kPreferredMask);
+        preferred = simcomFilterTelephonyDevices(preferred);
+        if (!preferred.isEmpty()) {
+            fallback.add(preferred.itemAt(0));
+        }
+    }
+
+    if (!fallback.isEmpty()) {
+        mSimcomLastVoiceRxDevices = fallback;
+        ALOGI("SIMCOM updateCallRouting: fell back to physical RX device=%s",
+              fallback.toString().c_str());
+    } else {
+        ALOGW("SIMCOM updateCallRouting: unable to resolve non-telephony RX device");
+    }
+    return fallback;
 }
 
 void AudioPolicyManager::simcomReleaseVoiceCallInput() {
@@ -883,6 +1001,10 @@ void AudioPolicyManager::simcomHandleVoiceCallInput(bool enable) {
     }
     simcomReleaseVoiceCallInput();
 }
+
+// SIMCOM: Removed simcomEnsureVoiceCallOutput and simcomReleaseVoiceCallOutput functions
+// Using existing output stream instead of creating dedicated 8kHz output
+
 sp<AudioPatch> AudioPolicyManager::createTelephonyPatch(
         bool isRx, const sp<DeviceDescriptor> &device, uint32_t delayMs) {
     ALOGI("SIMCOM: createTelephonyPatch START: isRx=%d device=%s delayMs=%u",
@@ -894,9 +1016,95 @@ sp<AudioPatch> AudioPolicyManager::createTelephonyPatch(
         return nullptr;
     }
     if (isRx) {
-        patchBuilder.addSink(device).
-                addSource(mAvailableInputDevices.getDevice(
-                    AUDIO_DEVICE_IN_TELEPHONY_RX, String8(), AUDIO_FORMAT_DEFAULT));
+        // SIMCOM: For RX path, ensure input stream is open for telephony RX device
+        // AudioFlinger requires an open input stream (AudioInputDescriptor) as source, not just a device
+        ALOGI("SIMCOM: createTelephonyPatch RX path: START device=%s", device->toString().c_str());
+        sp<AudioInputDescriptor> inputDesc = nullptr;
+        sp<DeviceDescriptor> rxSourceDevice = mAvailableInputDevices.getDevice(
+                AUDIO_DEVICE_IN_TELEPHONY_RX, String8(), AUDIO_FORMAT_DEFAULT);
+        if (rxSourceDevice == nullptr) {
+            ALOGE("SIMCOM: createTelephonyPatch RX path: Telephony RX device not available");
+            return nullptr;
+        }
+        ALOGI("SIMCOM: createTelephonyPatch RX path: Telephony RX device found devId=%d",
+              rxSourceDevice->getId());
+        
+        // Find existing input stream for telephony RX device, or open new one
+        ALOGI("SIMCOM: createTelephonyPatch RX path: checking existing inputs (count=%zu)",
+              mInputs.size());
+        for (size_t i = 0; i < mInputs.size(); i++) {
+            sp<AudioInputDescriptor> desc = mInputs.valueAt(i);
+            if (desc != nullptr) {
+                ALOGI("SIMCOM: createTelephonyPatch RX path: checking input[%zu] io=%d devId=%d",
+                      i, desc->mIoHandle, desc->getDevice()->getId());
+                if (desc->getDevice()->getId() == rxSourceDevice->getId()) {
+                    inputDesc = desc;
+                    ALOGI("SIMCOM: createTelephonyPatch RX path: found existing input stream io=%d portId=%d",
+                          desc->mIoHandle, mInputs.keyAt(i));
+                    break;
+                }
+            }
+        }
+        
+        if (inputDesc == nullptr) {
+            // Open input stream for telephony RX device
+            ALOGI("SIMCOM: createTelephonyPatch RX path: opening NEW input stream for telephony RX");
+            audio_attributes_t attr = AUDIO_ATTRIBUTES_INITIALIZER;
+            attr.source = AUDIO_SOURCE_VOICE_COMMUNICATION;
+            attr.usage = AUDIO_USAGE_VOICE_COMMUNICATION;
+            
+            audio_config_base_t config{};
+            config.sample_rate = 8000;
+            config.channel_mask = AUDIO_CHANNEL_IN_MONO;
+            config.format = AUDIO_FORMAT_PCM_16_BIT;
+            
+            audio_io_handle_t input = AUDIO_IO_HANDLE_NONE;
+            audio_port_handle_t deviceId = rxSourceDevice->getId();
+            audio_port_handle_t portId = AUDIO_PORT_HANDLE_NONE;
+            input_type_t inputType = API_INPUT_INVALID;
+            
+            ALOGI("SIMCOM: createTelephonyPatch RX path: calling getInputForAttr devId=%d",
+                  deviceId);
+            status_t status = getInputForAttr(&attr, &input, AUDIO_UNIQUE_ID_ALLOCATE,
+                                              AUDIO_SESSION_ALLOCATE, AID_SYSTEM,
+                                              &config, AUDIO_INPUT_FLAG_NONE, &deviceId,
+                                              &inputType, &portId);
+            if (status != NO_ERROR) {
+                ALOGE("SIMCOM: createTelephonyPatch RX path: getInputForAttr FAILED status=%d input=%d portId=%d",
+                      status, input, portId);
+                return nullptr;
+            }
+            ALOGI("SIMCOM: createTelephonyPatch RX path: getInputForAttr SUCCESS input=%d portId=%d devId=%d",
+                  input, portId, deviceId);
+            
+            ALOGI("SIMCOM: createTelephonyPatch RX path: calling startInput portId=%d", portId);
+            status = startInput(portId);
+            if (status != NO_ERROR) {
+                ALOGE("SIMCOM: createTelephonyPatch RX path: startInput FAILED portId=%d status=%d",
+                      portId, status);
+                releaseInput(portId);
+                return nullptr;
+            }
+            ALOGI("SIMCOM: createTelephonyPatch RX path: startInput SUCCESS portId=%d", portId);
+            
+            inputDesc = mInputs.getInputForClient(portId);
+            if (inputDesc == nullptr) {
+                ALOGE("SIMCOM: createTelephonyPatch RX path: inputDesc is NULL after startInput portId=%d (inputs count=%zu)",
+                      portId, mInputs.size());
+                return nullptr;
+            }
+            ALOGI("SIMCOM: createTelephonyPatch RX path: inputDesc found io=%d portId=%d devId=%d",
+                  inputDesc->mIoHandle, portId, inputDesc->getDevice()->getId());
+        }
+        
+        if (rxSourceDevice == nullptr) {
+            ALOGE("SIMCOM: createTelephonyPatch RX path: rxSourceDevice is NULL, cannot create patch");
+            return nullptr;
+        }
+
+        ALOGI("SIMCOM: createTelephonyPatch RX path: adding telephony device as source devId=%d",
+              rxSourceDevice->getId());
+        patchBuilder.addSink(device).addSource(rxSourceDevice);
     } else {
         // For TX path: sink is Telephony TX device, source will be added later (output stream)
         // Don't add input device as source - it's already connected to input stream
@@ -911,7 +1119,7 @@ sp<AudioPatch> AudioPolicyManager::createTelephonyPatch(
     
     audio_io_handle_t output = AUDIO_IO_HANDLE_NONE;
     if (isRx) {
-        // For RX path: find output stream for the sink device
+        // For RX path: use existing output stream
         SortedVector<audio_io_handle_t> outputs =
                 getOutputsForDevices(DeviceVector(outputDevice), mOutputs);
         output = selectOutput(outputs);
@@ -932,11 +1140,8 @@ sp<AudioPatch> AudioPolicyManager::createTelephonyPatch(
                 ALOGI("SIMCOM: createTelephonyPatch() found output %d for Telephony TX device", output);
             }
         }
-        // Fallback to primary output if no output found for Telephony TX
-        if (output == AUDIO_IO_HANDLE_NONE && hasPrimaryOutput() && mPrimaryOutput != nullptr) {
-            output = mPrimaryOutput->mIoHandle;
-            ALOGI("SIMCOM: createTelephonyPatch() using primary output %d for TX path (fallback)", output);
-        }
+        // Do not fallback to primary output; if Telephony TX does not expose a dedicated stream,
+        // rely on legacy routing instead of hijacking the primary speaker path.
     }
     
     ALOGI("SIMCOM: createTelephonyPatch() outputDevice=%s selected output=%d (isRx=%d)",
@@ -956,6 +1161,7 @@ sp<AudioPatch> AudioPolicyManager::createTelephonyPatch(
         ALOGW("SIMCOM: createTelephonyPatch() no output stream found for device %s (isRx=%d)",
               outputDevice != nullptr ? outputDevice->toString().c_str() : "null", isRx);
     }
+
 
     if (isRx && output != AUDIO_IO_HANDLE_NONE && device != nullptr) {
         AudioParameter routeParam;
@@ -1053,16 +1259,56 @@ bool AudioPolicyManager::isDeviceOfModule(
 
 void AudioPolicyManager::setPhoneState(audio_mode_t state)
 {
+    // SIMCOM: Force logging using multiple methods
+    __android_log_print(ANDROID_LOG_ERROR, "APM_AudioPolicyManager", "SIMCOM setPhoneState: FUNCTION ENTRY state=%d", state);
+    ALOGE("SIMCOM setPhoneState: FUNCTION ENTRY state=%d", state);
     ALOGV("setPhoneState() state %d", state);
     // store previous phone state for management of sonification strategy below
-    int oldState = mEngine->getPhoneState();
+    audio_mode_t oldState = mEngine->getPhoneState();
 
-    if (mEngine->setPhoneState(state) != NO_ERROR) {
-        ALOGW("setPhoneState() invalid or same state %d", state);
+    ALOGE("SIMCOM setPhoneState: ENTRY oldState=%d newState=%d hasPrimaryOutput=%d",
+          oldState, state, hasPrimaryOutput() ? 1 : 0);
+
+    // SIMCOM: Check if state is the same before attempting to set it
+    if (state == oldState) {
+        ALOGV("setPhoneState() same state: %d", state);
+        ALOGE("SIMCOM setPhoneState: SAME STATE oldState=%d newState=%d", oldState, state);
+        
+        // FORCE CALL ROUTING UPDATE FOR IN_CALL MODE TO FIX RX AUDIO PATH
+        // This ensures updateCallRouting() is always called when entering IN_CALL mode,
+        // even if the phone state hasn't changed, to fix RX audio path (modem -> speaker)
+        if (state == AUDIO_MODE_IN_CALL && hasPrimaryOutput()) {
+            ALOGE("SIMCOM setPhoneState: FORCING updateCallRouting for IN_CALL (same state) to fix RX audio path");
+            usleep(10000); // 10ms delay to ensure devices are registered
+            DeviceVector immediateDevices = getNewOutputDevices(mPrimaryOutput, false /*fromCache*/);
+            ALOGE("SIMCOM setPhoneState: IN_CALL immediate device update -> %s (size=%zu)",
+                  immediateDevices.toString().c_str(), immediateDevices.size());
+            if (!immediateDevices.isEmpty()) {
+                setOutputDevices(mPrimaryOutput, immediateDevices, true /*force*/, 0 /*delayMs*/);
+                ALOGE("SIMCOM setPhoneState: CALLING updateCallRouting(forced) rxDevices=%zu delayMs=0",
+                      immediateDevices.size());
+                updateCallRouting(immediateDevices, 0);
+                ALOGE("SIMCOM setPhoneState: RETURNED from updateCallRouting(forced)");
+            } else {
+                ALOGW("SIMCOM setPhoneState: No output devices available for updateCallRouting");
+            }
+        }
         return;
     }
+
+    // Attempt to set the phone state in the engine
+    status_t status = mEngine->setPhoneState(state);
+    if (status != NO_ERROR) {
+        ALOGW("setPhoneState() invalid state %d", state);
+        ALOGE("SIMCOM setPhoneState: INVALID STATE oldState=%d newState=%d", oldState, state);
+        return;
+    }
+    const bool oldStateInCall = isStateInCall(oldState);
+    const bool newStateInCall = isStateInCall(state);
+    const bool enteringCall = newStateInCall && !oldStateInCall;
+
     /// Opens: can these line be executed after the switch of volume curves???
-    if (isStateInCall(oldState)) {
+    if (oldStateInCall) {
         ALOGV("setPhoneState() in call state management: new state is %d", state);
         // force reevaluating accessibility routing when call stops
         mpClientInterface->invalidateStream(AUDIO_STREAM_ACCESSIBILITY);
@@ -1072,27 +1318,49 @@ void AudioPolicyManager::setPhoneState(audio_mode_t state)
      * Switching to or from incall state or switching between telephony and VoIP lead to force
      * routing command.
      */
-    bool force = ((is_state_in_call(oldState) != is_state_in_call(state))
-                  || (is_state_in_call(state) && (state != oldState)));
+    bool force = ((oldStateInCall != newStateInCall)
+                  || (newStateInCall && (state != oldState)));
 
-    ALOGI("SIMCOM setPhoneState: old=%d new=%d force=%d outputs=%zu primary=%p",
+    if (enteringCall) {
+        ALOGI("SIMCOM setPhoneState: entering call, pre-invalidating accessibility stream");
+        mpClientInterface->invalidateStream(AUDIO_STREAM_ACCESSIBILITY);
+    }
+
+    ALOGW("SIMCOM setPhoneState: old=%d new=%d force=%d outputs=%zu primary=%p",
           oldState, state, force, mOutputs.size(),
           hasPrimaryOutput() ? mPrimaryOutput.get() : nullptr);
 
     if (state == AUDIO_MODE_IN_CALL && hasPrimaryOutput()) {
-        usleep(10000);
+        ALOGW("SIMCOM setPhoneState: entering IN_CALL mode, setting up routing hasPrimaryOutput=%d",
+              hasPrimaryOutput() ? 1 : 0);
+        usleep(10000); // 10ms delay
         DeviceVector immediateDevices = getNewOutputDevices(mPrimaryOutput, false /*fromCache*/);
-        ALOGI("SIMCOM setPhoneState: IN_CALL immediate device update -> %s",
-              immediateDevices.toString().c_str());
+        ALOGW("SIMCOM setPhoneState: IN_CALL immediate device update -> %s (size=%zu)",
+              immediateDevices.toString().c_str(), immediateDevices.size());
         setOutputDevices(mPrimaryOutput, immediateDevices, true /*force*/, 0 /*delayMs*/);
+        ALOGW("SIMCOM setPhoneState: CALLING updateCallRouting(1) rxDevices=%zu delayMs=0",
+              immediateDevices.size());
         updateCallRouting(immediateDevices, 0);
+        ALOGW("SIMCOM setPhoneState: RETURNED from updateCallRouting(1), currentPhoneState=%d",
+              mEngine->getPhoneState());
+    } else if (state != AUDIO_MODE_IN_CALL && oldState == AUDIO_MODE_IN_CALL) {
+        ALOGI("SIMCOM setPhoneState: exiting IN_CALL mode (old=%d new=%d), currentPhoneState=%d",
+              oldState, state, mEngine->getPhoneState());
     }
 
+    // SIMCOM: Log before checkForDeviceAndOutputChanges to track state
+    ALOGI("SIMCOM setPhoneState: before checkForDeviceAndOutputChanges: state=%d oldState=%d outputs=%zu",
+          state, oldState, mOutputs.size());
+    
     // check for device and output changes triggered by new phone state
     checkForDeviceAndOutputChanges();
+    
+    // SIMCOM: Log after checkForDeviceAndOutputChanges to track state
+    ALOGI("SIMCOM setPhoneState: after checkForDeviceAndOutputChanges: state=%d currentPhoneState=%d",
+          state, mEngine->getPhoneState());
 
     int delayMs = 0;
-    if (isStateInCall(state)) {
+    if (newStateInCall) {
         nsecs_t sysTime = systemTime();
         auto musicStrategy = streamToStrategy(AUDIO_STREAM_MUSIC);
         auto sonificationStrategy = streamToStrategy(AUDIO_STREAM_ALARM);
@@ -1132,14 +1400,17 @@ void AudioPolicyManager::setPhoneState(audio_mode_t state)
         DeviceVector rxDevices = getNewOutputDevices(mPrimaryOutput, false /*fromCache*/);
         // force routing command to audio hardware when ending call
         // even if no device change is needed
-        if (isStateInCall(oldState) && rxDevices.isEmpty()) {
+        if (oldStateInCall && rxDevices.isEmpty()) {
             rxDevices = mPrimaryOutput->devices();
         }
 
-        ALOGI("SIMCOM setPhoneState: routing update for state=%d rxDevices=%zu delayMs=%d",
-              state, rxDevices.size(), delayMs);
+        ALOGW("SIMCOM setPhoneState: routing update for state=%d rxDevices=%zu delayMs=%d hasPrimaryOutput=%d",
+              state, rxDevices.size(), delayMs, hasPrimaryOutput() ? 1 : 0);
         if (state == AUDIO_MODE_IN_CALL) {
+            ALOGW("SIMCOM setPhoneState: CALLING updateCallRouting rxDevices=%zu delayMs=%d",
+                  rxDevices.size(), delayMs);
             updateCallRouting(rxDevices, delayMs);
+            ALOGW("SIMCOM setPhoneState: RETURNED from updateCallRouting");
         } else if (oldState == AUDIO_MODE_IN_CALL) {
             releaseTelephonyPatch(true, "call state exit");
             releaseTelephonyPatch(false, "call state exit");
@@ -1162,15 +1433,10 @@ void AudioPolicyManager::setPhoneState(audio_mode_t state)
         simcomHandleVoiceCallInput(false);
     }
 
-    if (isStateInCall(state)) {
-        ALOGV("setPhoneState() in call state management: new state is %d", state);
-        // force reevaluating accessibility routing when call starts
-        mpClientInterface->invalidateStream(AUDIO_STREAM_ACCESSIBILITY);
-    }
-
     // Flag that ringtone volume must be limited to music volume until we exit MODE_RINGTONE
     mLimitRingtoneVolume = (state == AUDIO_MODE_RINGTONE &&
                             isStreamActive(AUDIO_STREAM_MUSIC, SONIFICATION_HEADSET_MUSIC_DELAY));
+    return;
 }
 
 audio_mode_t AudioPolicyManager::getPhoneState() {
@@ -1563,9 +1829,12 @@ audio_io_handle_t AudioPolicyManager::getOutputForDevices(
     } else if (stream == AUDIO_STREAM_VOICE_CALL &&
                audio_is_linear_pcm(config->format) &&
                (*flags & AUDIO_OUTPUT_FLAG_INCALL_MUSIC) == 0) {
-        *flags = (audio_output_flags_t)(AUDIO_OUTPUT_FLAG_VOIP_RX |
-                                       AUDIO_OUTPUT_FLAG_DIRECT);
-        ALOGV("Set VoIP and Direct output flags for PCM format");
+        // SIMCOM: Don't automatically add DIRECT flag - let explicit VOIP_RX flag control behavior
+        // *flags = (audio_output_flags_t)(AUDIO_OUTPUT_FLAG_VOIP_RX | AUDIO_OUTPUT_FLAG_DIRECT);
+        if ((*flags & AUDIO_OUTPUT_FLAG_VOIP_RX) == 0) {
+            *flags = (audio_output_flags_t)(*flags | AUDIO_OUTPUT_FLAG_VOIP_RX);
+        }
+        ALOGV("Set VoIP output flag for PCM format (DIRECT disabled)");
     }
 
 
@@ -4736,7 +5005,8 @@ AudioPolicyManager::AudioPolicyManager(AudioPolicyClientInterface *clientInterfa
     mSimcomVoicePortId(AUDIO_PORT_HANDLE_NONE),
     mSimcomVoiceInputHandle(AUDIO_IO_HANDLE_NONE),
     mSimcomVoiceDeviceId(AUDIO_PORT_HANDLE_NONE),
-    mSimcomVoiceInputType(API_INPUT_INVALID)
+    mSimcomVoiceInputType(API_INPUT_INVALID),
+    mSimcomTxPatchBlocked(false)
 {
 }
 
